@@ -18,6 +18,7 @@ RELAY_PUBKEY="${RELAY_PUBKEY:-}"
 ADMIN_PUBKEYS="${ADMIN_PUBKEYS:-}"
 GROUPS_ADMIN_CREATE_ONLY="${GROUPS_ADMIN_CREATE_ONLY:-true}"
 GROUPS_PRIVATE_ADMIN_ONLY="${GROUPS_PRIVATE_ADMIN_ONLY:-true}"
+GROUPS_PRIVATE_RELAY_ADMIN_ACCESS="${GROUPS_PRIVATE_RELAY_ADMIN_ACCESS:-false}"
 
 # Create directories
 mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$MEDIA_DIR"
@@ -60,6 +61,7 @@ enabled = true
 auto_join = true
 admin_create_only = $GROUPS_ADMIN_CREATE_ONLY
 private_admin_only = $GROUPS_PRIVATE_ADMIN_ONLY
+private_relay_admin_access = $GROUPS_PRIVATE_RELAY_ADMIN_ACCESS
 EOF
 
     # Add admin role if pubkeys provided

@@ -136,6 +136,14 @@ func (g *GroupStore) IsAdmin(h string, pubkey nostr.PubKey) bool {
 }
 
 func (g *GroupStore) GetAdmins(h string) []nostr.PubKey {
+	// For private groups without relay admin access, only the creator is admin
+	if h != "_" && g.IsPrivateGroup(h) && !g.Config.Groups.PrivateRelayAdminAccess {
+		creator := g.GetGroupCreator(h)
+		if creator != "" {
+			return []nostr.PubKey{creator}
+		}
+		return []nostr.PubKey{}
+	}
 	return g.Management.GetAdmins()
 }
 
@@ -286,9 +294,38 @@ func GetInviteCodeFromEvent(event nostr.Event) string {
 	return ""
 }
 
+// Private group helpers
+
+func (g *GroupStore) IsPrivateGroup(h string) bool {
+	meta, found := g.GetMetadata(h)
+	if !found {
+		return false
+	}
+	return HasTag(meta.Tags, "private")
+}
+
+func (g *GroupStore) GetGroupCreator(h string) nostr.PubKey {
+	filter := nostr.Filter{
+		Kinds: []nostr.Kind{nostr.KindSimpleGroupCreateGroup},
+		Tags:  nostr.TagMap{"h": []string{h}},
+	}
+	for event := range g.Events.QueryEvents(filter, 1) {
+		return event.PubKey
+	}
+	return ""
+}
+
+func (g *GroupStore) IsGroupCreator(h string, pubkey nostr.PubKey) bool {
+	return g.GetGroupCreator(h) == pubkey
+}
+
 // Other stuff
 
 func (g *GroupStore) HasAccess(h string, pubkey nostr.PubKey) bool {
+	// For private groups without relay admin access, only members and creator have access
+	if g.IsPrivateGroup(h) && !g.Config.Groups.PrivateRelayAdminAccess {
+		return g.IsMember(h, pubkey) || g.IsGroupCreator(h, pubkey)
+	}
 	return g.Config.CanManage(pubkey) || g.IsAdmin(h, pubkey) || g.IsMember(h, pubkey)
 }
 
@@ -390,8 +427,15 @@ func (g *GroupStore) CheckWrite(event nostr.Event) string {
 		return "invalid: group not found"
 	}
 
-	if slices.Contains(nip29.ModerationEventKinds, event.Kind) && !g.Config.CanManage(event.PubKey) {
-		return "restricted: you are not authorized to manage groups"
+	if slices.Contains(nip29.ModerationEventKinds, event.Kind) {
+		if g.IsPrivateGroup(h) && !g.Config.Groups.PrivateRelayAdminAccess {
+			// For private groups without relay admin access, only the creator can moderate
+			if !g.IsGroupCreator(h, event.PubKey) {
+				return "restricted: only the group creator can manage private groups"
+			}
+		} else if !g.Config.CanManage(event.PubKey) {
+			return "restricted: you are not authorized to manage groups"
+		}
 	}
 
 	// Handle join requests - check invite code for private/hidden groups

@@ -33,10 +33,11 @@ type Config struct {
 	} `toml:"policy"`
 
 	Groups struct {
-		Enabled          bool `toml:"enabled"`
-		AutoJoin         bool `toml:"auto_join"`
-		AdminCreateOnly  bool `toml:"admin_create_only"`  // Only admins can create groups
-		PrivateAdminOnly bool `toml:"private_admin_only"` // Only admins can create private groups
+		Enabled                 bool `toml:"enabled"`
+		AutoJoin                bool `toml:"auto_join"`
+		AdminCreateOnly         bool `toml:"admin_create_only"`          // Only admins can create groups
+		PrivateAdminOnly        bool `toml:"private_admin_only"`         // Only admins can create private groups
+		PrivateRelayAdminAccess bool `toml:"private_relay_admin_access"` // Relay admins can see and moderate private groups
 	} `toml:"groups"`
 
 	Management struct {
