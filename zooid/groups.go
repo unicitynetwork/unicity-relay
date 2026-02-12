@@ -433,7 +433,7 @@ func (g *GroupStore) CheckWrite(event nostr.Event) string {
 			if !g.IsGroupCreator(h, event.PubKey) {
 				return "restricted: only the group creator can manage private groups"
 			}
-		} else if !g.Config.CanManage(event.PubKey) {
+		} else if !g.Config.CanManage(event.PubKey) && !g.IsGroupCreator(h, event.PubKey) {
 			return "restricted: you are not authorized to manage groups"
 		}
 	}
