@@ -19,6 +19,14 @@ if g.Config.Policy.Open && !HasTag(meta.Tags, "private") {
 
 This enables the "browse and join" workflow where users can discover public groups, view their messages, and then join if interested.
 
+### Group Creation and Privacy Controls
+
+Added configurable group creation policies and private group access control:
+
+- `admin_create_only` — only relay admins can create groups
+- `private_admin_only` — only relay admins can create private groups (public groups open to all)
+- `private_relay_admin_access` — when `false`, relay admins cannot see or moderate private groups; only the group creator can moderate their own private group
+
 ### Configuration for Sphere
 
 The relay is configured with:
@@ -74,6 +82,9 @@ Configures NIP 29 support.
 
 - `enabled` - whether NIP 29 is enabled.
 - `auto_join` - whether relay members can join groups without approval. Defaults to `false`.
+- `admin_create_only` - only relay admins can create groups. Defaults to `true`.
+- `private_admin_only` - only relay admins can create private groups. Defaults to `true`.
+- `private_relay_admin_access` - relay admins can see and moderate private groups. When `false`, only the group creator can moderate their private group. Defaults to `false`.
 
 ### `[management]`
 
@@ -249,4 +260,6 @@ When running in AWS ECS, these environment variables configure the relay:
 | `RELAY_NAME` | Display name |
 | `RELAY_DESCRIPTION` | Description |
 | `ADMIN_PUBKEYS` | Admin pubkeys (quoted, comma-separated) |
-
+| `GROUPS_ADMIN_CREATE_ONLY` | Only admins can create groups (default: `true`) |
+| `GROUPS_PRIVATE_ADMIN_ONLY` | Only admins can create private groups (default: `true`) |
+| `GROUPS_PRIVATE_RELAY_ADMIN_ACCESS` | Relay admins can see/moderate private groups (default: `false`) |
