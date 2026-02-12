@@ -79,8 +79,9 @@ type relayContainer struct {
 }
 
 type relayConfig struct {
-	adminCreateOnly  bool
-	privateAdminOnly bool
+	adminCreateOnly         bool
+	privateAdminOnly        bool
+	privateRelayAdminAccess bool
 }
 
 func setupRelay(ctx context.Context, t *testing.T, adminCreateOnly bool) *relayContainer {
@@ -93,25 +94,24 @@ func setupRelay(ctx context.Context, t *testing.T, adminCreateOnly bool) *relayC
 func setupRelayWithConfig(ctx context.Context, t *testing.T, cfg relayConfig) *relayContainer {
 	image := buildImage(t)
 
-	adminCreateOnlyStr := "false"
-	if cfg.adminCreateOnly {
-		adminCreateOnlyStr = "true"
-	}
-	privateAdminOnlyStr := "false"
-	if cfg.privateAdminOnly {
-		privateAdminOnlyStr = "true"
+	boolStr := func(b bool) string {
+		if b {
+			return "true"
+		}
+		return "false"
 	}
 
 	req := testcontainers.ContainerRequest{
 		Image:        image,
 		ExposedPorts: []string{"3334/tcp"},
 		Env: map[string]string{
-			"RELAY_HOST":                "localhost",
-			"RELAY_SECRET":              relaySecret.Hex(),
-			"RELAY_PUBKEY":              adminPubkey.Hex(),
-			"ADMIN_PUBKEYS":             fmt.Sprintf(`"%s"`, adminPubkey.Hex()),
-			"GROUPS_ADMIN_CREATE_ONLY":  adminCreateOnlyStr,
-			"GROUPS_PRIVATE_ADMIN_ONLY": privateAdminOnlyStr,
+			"RELAY_HOST":                        "localhost",
+			"RELAY_SECRET":                      relaySecret.Hex(),
+			"RELAY_PUBKEY":                      adminPubkey.Hex(),
+			"ADMIN_PUBKEYS":                     fmt.Sprintf(`"%s"`, adminPubkey.Hex()),
+			"GROUPS_ADMIN_CREATE_ONLY":          boolStr(cfg.adminCreateOnly),
+			"GROUPS_PRIVATE_ADMIN_ONLY":         boolStr(cfg.privateAdminOnly),
+			"GROUPS_PRIVATE_RELAY_ADMIN_ACCESS": boolStr(cfg.privateRelayAdminAccess),
 		},
 		WaitingFor: wait.ForListeningPort("3334/tcp").WithStartupTimeout(30 * time.Second),
 	}
@@ -1714,4 +1714,280 @@ func TestIntegration_PublicGroupDoesNotRequireInvite(t *testing.T) {
 	}
 
 	t.Logf("User successfully joined public group without invite code")
+}
+
+// Private Relay Admin Access Tests
+
+func TestIntegration_RelayAdminCannotSeePrivateGroupWhenAccessDisabled(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	relay := setupRelayWithConfig(ctx, t, relayConfig{
+		adminCreateOnly:         false,
+		privateAdminOnly:        false,
+		privateRelayAdminAccess: false, // Relay admins cannot see private groups
+	})
+	defer relay.Container.Terminate(ctx)
+
+	// Non-admin creates a private group
+	userClient := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
+
+	createEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindCreateGroup),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "user-private-group"}},
+		Content:   `{"name":"User Private Group","private":true}`,
+	}
+
+	result := userClient.sendEvent(ctx, t, createEvent)
+	if result != "ok" {
+		t.Fatalf("Non-admin should be able to create private group: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Creator sends a message
+	msgEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindGroupChatMessage),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "user-private-group"}},
+		Content:   "Secret from creator",
+	}
+
+	result = userClient.sendEvent(ctx, t, msgEvent)
+	if result != "ok" {
+		t.Fatalf("Creator should be able to post: %s", result)
+	}
+	userClient.close()
+
+	// Relay admin (not the creator) tries to read
+	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
+	defer adminClient.close()
+
+	filter := map[string]interface{}{
+		"kinds": []int{KindGroupChatMessage},
+		"#h":    []string{"user-private-group"},
+	}
+
+	events := adminClient.subscribe(ctx, t, "admin-no-access", filter)
+	if len(events) > 0 {
+		t.Fatal("Relay admin should NOT be able to see private group messages when private_relay_admin_access=false")
+	}
+
+	t.Logf("Relay admin correctly cannot see private group content")
+}
+
+func TestIntegration_RelayAdminCanSeePrivateGroupWhenAccessEnabled(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	relay := setupRelayWithConfig(ctx, t, relayConfig{
+		adminCreateOnly:         false,
+		privateAdminOnly:        false,
+		privateRelayAdminAccess: true, // Relay admins CAN see private groups
+	})
+	defer relay.Container.Terminate(ctx)
+
+	// Non-admin creates a private group
+	userClient := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
+
+	createEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindCreateGroup),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "user-private-visible"}},
+		Content:   `{"name":"Visible Private Group","private":true}`,
+	}
+
+	result := userClient.sendEvent(ctx, t, createEvent)
+	if result != "ok" {
+		t.Fatalf("Non-admin should be able to create private group: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Creator sends a message
+	msgEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindGroupChatMessage),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "user-private-visible"}},
+		Content:   "Secret from creator",
+	}
+
+	result = userClient.sendEvent(ctx, t, msgEvent)
+	if result != "ok" {
+		t.Fatalf("Creator should be able to post: %s", result)
+	}
+	userClient.close()
+
+	// Relay admin CAN read when access is enabled
+	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
+	defer adminClient.close()
+
+	filter := map[string]interface{}{
+		"kinds": []int{KindGroupChatMessage},
+		"#h":    []string{"user-private-visible"},
+	}
+
+	events := adminClient.subscribe(ctx, t, "admin-has-access", filter)
+	if len(events) == 0 {
+		t.Fatal("Relay admin should be able to see private group messages when private_relay_admin_access=true")
+	}
+
+	t.Logf("Relay admin can see private group content when access enabled")
+}
+
+func TestIntegration_RelayAdminCannotModeratePrivateGroupWhenAccessDisabled(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	relay := setupRelayWithConfig(ctx, t, relayConfig{
+		adminCreateOnly:         false,
+		privateAdminOnly:        false,
+		privateRelayAdminAccess: false,
+	})
+	defer relay.Container.Terminate(ctx)
+
+	// Non-admin creates a private group
+	userClient := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
+
+	createEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindCreateGroup),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "user-no-moderate"}},
+		Content:   `{"name":"No Admin Moderate","private":true}`,
+	}
+
+	result := userClient.sendEvent(ctx, t, createEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to create group: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	userClient.close()
+
+	// Relay admin tries to delete the private group - should fail
+	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
+	defer adminClient.close()
+
+	deleteEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindDeleteGroup),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "user-no-moderate"}},
+		Content:   "",
+	}
+
+	result = adminClient.sendEvent(ctx, t, deleteEvent)
+	if result == "ok" {
+		t.Fatal("Relay admin should NOT be able to delete private group when private_relay_admin_access=false")
+	}
+
+	t.Logf("Relay admin correctly cannot moderate private group: %s", result)
+}
+
+func TestIntegration_CreatorCanModerateOwnPrivateGroup(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	relay := setupRelayWithConfig(ctx, t, relayConfig{
+		adminCreateOnly:         false,
+		privateAdminOnly:        false,
+		privateRelayAdminAccess: false,
+	})
+	defer relay.Container.Terminate(ctx)
+
+	// Non-admin creates a private group
+	userClient := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
+	defer userClient.close()
+
+	createEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindCreateGroup),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "creator-moderate"}},
+		Content:   `{"name":"Creator Moderate","private":true}`,
+	}
+
+	result := userClient.sendEvent(ctx, t, createEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to create group: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Creator deletes their own private group - should succeed
+	deleteEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindDeleteGroup),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "creator-moderate"}},
+		Content:   "",
+	}
+
+	result = userClient.sendEvent(ctx, t, deleteEvent)
+	if result != "ok" {
+		t.Fatalf("Creator should be able to delete their own private group, but got: %s", result)
+	}
+
+	t.Logf("Creator successfully moderated their own private group")
+}
+
+func TestIntegration_RelayAdminCanStillModeratePublicGroups(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	relay := setupRelayWithConfig(ctx, t, relayConfig{
+		adminCreateOnly:         false,
+		privateAdminOnly:        false,
+		privateRelayAdminAccess: false, // Even with this off, public groups should still be manageable
+	})
+	defer relay.Container.Terminate(ctx)
+
+	// Non-admin creates a public group
+	userClient := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
+
+	createEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindCreateGroup),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "public-admin-moderate"}},
+		Content:   `{"name":"Public Moderated"}`,
+	}
+
+	result := userClient.sendEvent(ctx, t, createEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to create group: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	userClient.close()
+
+	// Relay admin CAN delete the public group
+	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
+	defer adminClient.close()
+
+	deleteEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindDeleteGroup),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "public-admin-moderate"}},
+		Content:   "",
+	}
+
+	result = adminClient.sendEvent(ctx, t, deleteEvent)
+	if result != "ok" {
+		t.Fatalf("Relay admin should be able to delete public groups even with private_relay_admin_access=false, but got: %s", result)
+	}
+
+	t.Logf("Relay admin can still moderate public groups")
 }

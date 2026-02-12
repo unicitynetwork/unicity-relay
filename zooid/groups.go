@@ -139,7 +139,7 @@ func (g *GroupStore) GetAdmins(h string) []nostr.PubKey {
 	// For private groups without relay admin access, only the creator is admin
 	if h != "_" && g.IsPrivateGroup(h) && !g.Config.Groups.PrivateRelayAdminAccess {
 		creator := g.GetGroupCreator(h)
-		if creator != "" {
+		if creator != (nostr.PubKey{}) {
 			return []nostr.PubKey{creator}
 		}
 		return []nostr.PubKey{}
@@ -312,7 +312,7 @@ func (g *GroupStore) GetGroupCreator(h string) nostr.PubKey {
 	for event := range g.Events.QueryEvents(filter, 1) {
 		return event.PubKey
 	}
-	return ""
+	return nostr.PubKey{}
 }
 
 func (g *GroupStore) IsGroupCreator(h string, pubkey nostr.PubKey) bool {
