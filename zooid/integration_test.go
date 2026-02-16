@@ -343,6 +343,14 @@ func (c *nostrClient) subscribe(ctx context.Context, t *testing.T, subID string,
 	}
 }
 
+func (c *nostrClient) closeSubscription(ctx context.Context, t *testing.T, subID string) {
+	msg := []interface{}{"CLOSE", subID}
+	data, _ := json.Marshal(msg)
+	if err := c.conn.Write(ctx, websocket.MessageText, data); err != nil {
+		t.Logf("Failed to close subscription %s: %v", subID, err)
+	}
+}
+
 func TestIntegration_RelayAdminListPublished(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping integration test in short mode")
@@ -1990,4 +1998,326 @@ func TestIntegration_RelayAdminCanStillModeratePublicGroups(t *testing.T) {
 	}
 
 	t.Logf("Relay admin can still moderate public groups")
+}
+
+// Cache-specific integration tests
+
+func TestIntegration_CachedMembershipGrantsAndRevokesAccess(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	relay := setupRelayWithConfig(ctx, t, relayConfig{
+		adminCreateOnly:  false,
+		privateAdminOnly: true,
+	})
+	defer relay.Container.Terminate(ctx)
+
+	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
+
+	// Create private group and post a message
+	createEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindCreateGroup),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "cache-membership-test"}},
+		Content:   `{"name":"Cache Membership Test","private":true,"closed":true}`,
+	}
+
+	result := adminClient.sendEvent(ctx, t, createEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to create group: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	msgEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindGroupChatMessage),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "cache-membership-test"}},
+		Content:   "Cached content",
+	}
+	result = adminClient.sendEvent(ctx, t, msgEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to send message: %s", result)
+	}
+
+	// Step 1: Non-member cannot read (cache should not have them)
+	userClient1 := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
+
+	filter := map[string]interface{}{
+		"kinds": []int{KindGroupChatMessage},
+		"#h":    []string{"cache-membership-test"},
+	}
+
+	events := userClient1.subscribe(ctx, t, "before-add", filter)
+	if len(events) > 0 {
+		t.Fatal("Non-member should not see private group messages")
+	}
+	userClient1.close()
+
+	// Step 2: Add member — cache should update immediately
+	addEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindPutUser),
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"h", "cache-membership-test"},
+			{"p", nonAdminPubkey.Hex()},
+		},
+	}
+	result = adminClient.sendEvent(ctx, t, addEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to add member: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// New connection — cache-based read should work
+	userClient2 := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
+	events = userClient2.subscribe(ctx, t, "after-add", filter)
+	if len(events) == 0 {
+		t.Fatal("Member should see private group messages after being added (cache hit)")
+	}
+
+	// Close subscription before posting to avoid broadcast interference
+	userClient2.closeSubscription(ctx, t, "after-add")
+
+	// Step 3: Member can post to closed group
+	postEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindGroupChatMessage),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "cache-membership-test"}},
+		Content:   "Posted by cached member",
+	}
+	result = userClient2.sendEvent(ctx, t, postEvent)
+	if result != "ok" {
+		t.Fatalf("Cached member should be able to post to closed group: %s", result)
+	}
+	userClient2.close()
+
+	// Wait to ensure different timestamp for remove
+	time.Sleep(1100 * time.Millisecond)
+
+	// Step 4: Remove member — cache should update immediately
+	removeEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindRemoveUser),
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"h", "cache-membership-test"},
+			{"p", nonAdminPubkey.Hex()},
+		},
+	}
+	result = adminClient.sendEvent(ctx, t, removeEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to remove member: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	adminClient.close()
+
+	// New connection — cache should reflect removal
+	userClient3 := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
+	defer userClient3.close()
+
+	events = userClient3.subscribe(ctx, t, "after-remove", filter)
+	if len(events) > 0 {
+		t.Fatal("Removed member should not see private group messages (cache should be updated)")
+	}
+
+	// Step 5: Removed member cannot post to closed group
+	postEvent2 := &nostr.Event{
+		Kind:      nostr.Kind(KindGroupChatMessage),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "cache-membership-test"}},
+		Content:   "Should be rejected",
+	}
+	result = userClient3.sendEvent(ctx, t, postEvent2)
+	if result == "ok" {
+		t.Fatal("Removed member should not be able to post to closed group (cache should be updated)")
+	}
+
+	t.Logf("Cache correctly grants and revokes access through full membership lifecycle")
+}
+
+func TestIntegration_CachedMetadataReflectsUpdates(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	relay := setupRelayWithConfig(ctx, t, relayConfig{
+		adminCreateOnly:  false,
+		privateAdminOnly: true,
+	})
+	defer relay.Container.Terminate(ctx)
+
+	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
+	defer adminClient.close()
+
+	// Create a public group
+	createEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindCreateGroup),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "cache-meta-test"}},
+		Content:   `{"name":"Original Name","about":"Original description"}`,
+	}
+
+	result := adminClient.sendEvent(ctx, t, createEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to create group: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify initial metadata is cached and served
+	metaFilter := map[string]interface{}{
+		"kinds": []int{KindGroupMetadata},
+		"#d":    []string{"cache-meta-test"},
+	}
+
+	events := adminClient.subscribe(ctx, t, "initial-meta", metaFilter)
+	if len(events) == 0 {
+		t.Fatal("Initial metadata should be served")
+	}
+	if events[0].Content != `{"name":"Original Name","about":"Original description"}` {
+		t.Errorf("Initial metadata content mismatch: %s", events[0].Content)
+	}
+
+	// Close the subscription before sending edit to avoid broadcast interference
+	adminClient.closeSubscription(ctx, t, "initial-meta")
+
+	// Edit metadata
+	editEvent := &nostr.Event{
+		Kind:      nostr.Kind(9002), // KindSimpleGroupEditMetadata
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "cache-meta-test"}},
+		Content:   `{"name":"Updated Name","about":"Updated description"}`,
+	}
+
+	result = adminClient.sendEvent(ctx, t, editEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to edit metadata: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify updated metadata is served (not stale cache)
+	events = adminClient.subscribe(ctx, t, "updated-meta", metaFilter)
+	if len(events) == 0 {
+		t.Fatal("Updated metadata should be served")
+	}
+	if events[0].Content != `{"name":"Updated Name","about":"Updated description"}` {
+		t.Errorf("Metadata should be updated (not stale cache): got %s", events[0].Content)
+	}
+
+	t.Logf("Cache correctly reflects metadata updates")
+}
+
+func TestIntegration_CachedDeleteGroupClearsAccess(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	relay := setupRelayWithConfig(ctx, t, relayConfig{
+		adminCreateOnly:  false,
+		privateAdminOnly: true,
+	})
+	defer relay.Container.Terminate(ctx)
+
+	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
+
+	// Create group, add a member, post a message
+	createEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindCreateGroup),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "cache-delete-test"}},
+		Content:   `{"name":"To Be Deleted"}`,
+	}
+	result := adminClient.sendEvent(ctx, t, createEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to create group: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	addEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindPutUser),
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"h", "cache-delete-test"},
+			{"p", nonAdminPubkey.Hex()},
+		},
+	}
+	result = adminClient.sendEvent(ctx, t, addEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to add member: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	msgEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindGroupChatMessage),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "cache-delete-test"}},
+		Content:   "Message before delete",
+	}
+	result = adminClient.sendEvent(ctx, t, msgEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to send message: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify member can read
+	userClient := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
+
+	filter := map[string]interface{}{
+		"kinds": []int{KindGroupChatMessage},
+		"#h":    []string{"cache-delete-test"},
+	}
+
+	events := userClient.subscribe(ctx, t, "before-delete", filter)
+	if len(events) == 0 {
+		t.Fatal("Member should see messages before group deletion")
+	}
+	userClient.close()
+
+	// Delete the group — cache should be fully cleared
+	deleteEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindDeleteGroup),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "cache-delete-test"}},
+	}
+	result = adminClient.sendEvent(ctx, t, deleteEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to delete group: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	adminClient.close()
+
+	// Verify metadata is gone (cache cleared)
+	userClient2 := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
+	defer userClient2.close()
+
+	metaFilter := map[string]interface{}{
+		"kinds": []int{KindGroupMetadata},
+		"#d":    []string{"cache-delete-test"},
+	}
+	events = userClient2.subscribe(ctx, t, "meta-after-delete", metaFilter)
+	if len(events) > 0 {
+		t.Fatal("Metadata should not be served after group deletion (cache should be cleared)")
+	}
+
+	// Messages should also be gone
+	events = userClient2.subscribe(ctx, t, "msg-after-delete", filter)
+	if len(events) > 0 {
+		t.Fatal("Messages should not be served after group deletion")
+	}
+
+	t.Logf("Cache correctly cleared after group deletion")
 }
