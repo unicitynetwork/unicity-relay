@@ -2,6 +2,7 @@ package zooid
 
 import (
 	"encoding/json"
+	"sync"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip29"
@@ -43,17 +44,115 @@ func GetGroupIDFromEvent(event nostr.Event) string {
 	return ""
 }
 
+// Cache types
+
+type groupMetaCache struct {
+	event   nostr.Event
+	found   bool
+	private bool
+	hidden  bool
+	closed  bool
+}
+
+type memberSet struct {
+	mu      sync.RWMutex
+	members map[nostr.PubKey]struct{}
+}
+
 // Struct definition
 
 type GroupStore struct {
 	Config     *Config
 	Events     *EventStore
 	Management *ManagementStore
+
+	metadataCache   sync.Map // map[string]*groupMetaCache  (key = group h)
+	membershipCache sync.Map // map[string]*memberSet        (key = group h)
+	creatorCache    sync.Map // map[string]nostr.PubKey       (key = group h)
+	cachesWarmed    bool
+}
+
+func (g *GroupStore) WarmCaches() {
+	// Load all group metadata
+	metaFilter := nostr.Filter{
+		Kinds: []nostr.Kind{nostr.KindSimpleGroupMetadata},
+	}
+	for event := range g.Events.QueryEvents(metaFilter, 0) {
+		h := event.Tags.GetD()
+		if h == "" {
+			continue
+		}
+		g.metadataCache.Store(h, &groupMetaCache{
+			event:   event,
+			found:   true,
+			private: HasTag(event.Tags, "private"),
+			hidden:  HasTag(event.Tags, "hidden"),
+			closed:  HasTag(event.Tags, "closed"),
+		})
+	}
+
+	// Load all group creators
+	createFilter := nostr.Filter{
+		Kinds: []nostr.Kind{nostr.KindSimpleGroupCreateGroup},
+	}
+	for event := range g.Events.QueryEvents(createFilter, 0) {
+		h := GetGroupIDFromEvent(event)
+		if h == "" {
+			continue
+		}
+		g.creatorCache.Store(h, event.PubKey)
+	}
+
+	// Load all group memberships
+	memberFilter := nostr.Filter{
+		Kinds: []nostr.Kind{nostr.KindSimpleGroupPutUser, nostr.KindSimpleGroupRemoveUser},
+	}
+	// We need to process events oldest-first to replay the membership log correctly
+	allEvents := slices.Collect(g.Events.QueryEvents(memberFilter, 0))
+	for _, event := range Reversed(allEvents) {
+		h := GetGroupIDFromEvent(event)
+		if h == "" {
+			continue
+		}
+		for tag := range event.Tags.FindAll("p") {
+			pubkey, err := nostr.PubKeyFromHex(tag[1])
+			if err != nil {
+				continue
+			}
+			ms := g.getOrCreateMemberSet(h)
+			ms.mu.Lock()
+			if event.Kind == nostr.KindSimpleGroupPutUser {
+				ms.members[pubkey] = struct{}{}
+			} else {
+				delete(ms.members, pubkey)
+			}
+			ms.mu.Unlock()
+		}
+	}
+
+	g.cachesWarmed = true
+}
+
+func (g *GroupStore) getOrCreateMemberSet(h string) *memberSet {
+	if v, ok := g.membershipCache.Load(h); ok {
+		return v.(*memberSet)
+	}
+	ms := &memberSet{members: make(map[nostr.PubKey]struct{})}
+	actual, _ := g.membershipCache.LoadOrStore(h, ms)
+	return actual.(*memberSet)
 }
 
 // Metadata
 
 func (g *GroupStore) GetMetadata(h string) (nostr.Event, bool) {
+	if g.cachesWarmed {
+		if v, ok := g.metadataCache.Load(h); ok {
+			cached := v.(*groupMetaCache)
+			return cached.event, cached.found
+		}
+		return nostr.Event{}, false
+	}
+
 	filter := nostr.Filter{
 		Kinds: []nostr.Kind{nostr.KindSimpleGroupMetadata},
 		Tags: nostr.TagMap{
@@ -70,9 +169,11 @@ func (g *GroupStore) GetMetadata(h string) (nostr.Event, bool) {
 
 func (g *GroupStore) UpdateMetadata(event nostr.Event) error {
 	tags := nostr.Tags{}
+	var h string
 
 	for _, tag := range event.Tags {
 		if len(tag) >= 2 && tag[0] == "h" {
+			h = tag[1]
 			tags = append(tags, nostr.Tag{"d", tag[1]})
 		} else {
 			tags = append(tags, tag)
@@ -100,7 +201,21 @@ func (g *GroupStore) UpdateMetadata(event nostr.Event) error {
 		Content:   event.Content, // Include metadata JSON (name, about, picture, etc.)
 	}
 
-	return g.Events.SignAndStoreEvent(&metadataEvent, true)
+	if err := g.Events.SignAndStoreEvent(&metadataEvent, true); err != nil {
+		return err
+	}
+
+	if h != "" {
+		g.metadataCache.Store(h, &groupMetaCache{
+			event:   metadataEvent,
+			found:   true,
+			private: HasTag(tags, "private"),
+			hidden:  HasTag(tags, "hidden"),
+			closed:  HasTag(tags, "closed"),
+		})
+	}
+
+	return nil
 }
 
 // Deletion
@@ -127,6 +242,10 @@ func (g *GroupStore) DeleteGroup(h string) {
 			}
 		}
 	}
+
+	g.metadataCache.Delete(h)
+	g.membershipCache.Delete(h)
+	g.creatorCache.Delete(h)
 }
 
 // Admins
@@ -178,7 +297,16 @@ func (g *GroupStore) AddMember(h string, pubkey nostr.PubKey) error {
 		},
 	}
 
-	return g.Events.SignAndStoreEvent(&event, true)
+	if err := g.Events.SignAndStoreEvent(&event, true); err != nil {
+		return err
+	}
+
+	ms := g.getOrCreateMemberSet(h)
+	ms.mu.Lock()
+	ms.members[pubkey] = struct{}{}
+	ms.mu.Unlock()
+
+	return nil
 }
 
 func (g *GroupStore) RemoveMember(h string, pubkey nostr.PubKey) error {
@@ -191,10 +319,32 @@ func (g *GroupStore) RemoveMember(h string, pubkey nostr.PubKey) error {
 		},
 	}
 
-	return g.Events.SignAndStoreEvent(&event, true)
+	if err := g.Events.SignAndStoreEvent(&event, true); err != nil {
+		return err
+	}
+
+	if v, ok := g.membershipCache.Load(h); ok {
+		ms := v.(*memberSet)
+		ms.mu.Lock()
+		delete(ms.members, pubkey)
+		ms.mu.Unlock()
+	}
+
+	return nil
 }
 
 func (g *GroupStore) IsMember(h string, pubkey nostr.PubKey) bool {
+	if g.cachesWarmed {
+		if v, ok := g.membershipCache.Load(h); ok {
+			ms := v.(*memberSet)
+			ms.mu.RLock()
+			_, found := ms.members[pubkey]
+			ms.mu.RUnlock()
+			return found
+		}
+		return false
+	}
+
 	filter := nostr.Filter{
 		Kinds: []nostr.Kind{nostr.KindSimpleGroupPutUser, nostr.KindSimpleGroupRemoveUser},
 		Tags: nostr.TagMap{
@@ -217,6 +367,20 @@ func (g *GroupStore) IsMember(h string, pubkey nostr.PubKey) bool {
 }
 
 func (g *GroupStore) GetMembers(h string) []nostr.PubKey {
+	if g.cachesWarmed {
+		if v, ok := g.membershipCache.Load(h); ok {
+			ms := v.(*memberSet)
+			ms.mu.RLock()
+			result := make([]nostr.PubKey, 0, len(ms.members))
+			for pk := range ms.members {
+				result = append(result, pk)
+			}
+			ms.mu.RUnlock()
+			return result
+		}
+		return []nostr.PubKey{}
+	}
+
 	filter := nostr.Filter{
 		Kinds: []nostr.Kind{nostr.KindSimpleGroupPutUser, nostr.KindSimpleGroupRemoveUser},
 		Tags: nostr.TagMap{
@@ -297,6 +461,13 @@ func GetInviteCodeFromEvent(event nostr.Event) string {
 // Private group helpers
 
 func (g *GroupStore) IsPrivateGroup(h string) bool {
+	if g.cachesWarmed {
+		if v, ok := g.metadataCache.Load(h); ok {
+			return v.(*groupMetaCache).private
+		}
+		return false
+	}
+
 	meta, found := g.GetMetadata(h)
 	if !found {
 		return false
@@ -305,6 +476,13 @@ func (g *GroupStore) IsPrivateGroup(h string) bool {
 }
 
 func (g *GroupStore) GetGroupCreator(h string) nostr.PubKey {
+	if g.cachesWarmed {
+		if v, ok := g.creatorCache.Load(h); ok {
+			return v.(nostr.PubKey)
+		}
+		return nostr.PubKey{}
+	}
+
 	filter := nostr.Filter{
 		Kinds: []nostr.Kind{nostr.KindSimpleGroupCreateGroup},
 		Tags:  nostr.TagMap{"h": []string{h}},

@@ -2,6 +2,8 @@ package zooid
 
 import (
 	"context"
+	"sync"
+
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/khatru"
 	"fiatjaf.com/nostr/nip86"
@@ -23,11 +25,53 @@ import (
 type ManagementStore struct {
 	Config *Config
 	Events *EventStore
+
+	relayMembers  sync.Map // map[nostr.PubKey]struct{}
+	bannedPubkeys sync.Map // map[nostr.PubKey]string (reason)
+	bannedEvents  sync.Map // map[nostr.ID]string (reason)
+	cachesWarmed  bool
+}
+
+func (m *ManagementStore) WarmCaches() {
+	// Load relay members
+	for tag := range m.Events.GetOrCreateRelayMembersList().Tags.FindAll("member") {
+		if pubkey, err := nostr.PubKeyFromHex(tag[1]); err == nil {
+			m.relayMembers.Store(pubkey, struct{}{})
+		}
+	}
+
+	// Load banned pubkeys
+	for tag := range m.Events.GetOrCreateApplicationSpecificData(BANNED_PUBKEYS).Tags.FindAll("banned") {
+		if pubkey, err := nostr.PubKeyFromHex(tag[1]); err == nil {
+			m.bannedPubkeys.Store(pubkey, tag[2])
+		}
+	}
+
+	// Load banned events
+	for tag := range m.Events.GetOrCreateApplicationSpecificData(BANNED_EVENTS).Tags.FindAll("event") {
+		if id, err := nostr.IDFromHex(tag[1]); err == nil {
+			m.bannedEvents.Store(id, tag[2])
+		}
+	}
+
+	m.cachesWarmed = true
 }
 
 // Banned events
 
 func (m *ManagementStore) GetBannedEventItems() []nip86.IDReason {
+	if m.cachesWarmed {
+		items := make([]nip86.IDReason, 0)
+		m.bannedEvents.Range(func(key, value any) bool {
+			items = append(items, nip86.IDReason{
+				ID:     key.(nostr.ID),
+				Reason: value.(string),
+			})
+			return true
+		})
+		return items
+	}
+
 	items := make([]nip86.IDReason, 0)
 	for tag := range m.Events.GetOrCreateApplicationSpecificData(BANNED_EVENTS).Tags.FindAll("event") {
 		if id, err := nostr.IDFromHex(tag[1]); err == nil {
@@ -50,7 +94,12 @@ func (m *ManagementStore) BanEvent(id nostr.ID, reason string) error {
 	event.CreatedAt = nostr.Now()
 	event.Tags = append(event.Tags, nostr.Tag{"event", id.Hex(), reason})
 
-	return m.Events.SignAndStoreEvent(&event, false)
+	if err := m.Events.SignAndStoreEvent(&event, false); err != nil {
+		return err
+	}
+
+	m.bannedEvents.Store(id, reason)
+	return nil
 }
 
 func (m *ManagementStore) AllowEvent(id nostr.ID, reason string) error {
@@ -60,10 +109,20 @@ func (m *ManagementStore) AllowEvent(id nostr.ID, reason string) error {
 		return t[1] != id.Hex()
 	})
 
-	return m.Events.SignAndStoreEvent(&event, false)
+	if err := m.Events.SignAndStoreEvent(&event, false); err != nil {
+		return err
+	}
+
+	m.bannedEvents.Delete(id)
+	return nil
 }
 
 func (m *ManagementStore) EventIsBanned(id nostr.ID) bool {
+	if m.cachesWarmed {
+		_, found := m.bannedEvents.Load(id)
+		return found
+	}
+
 	event := m.Events.GetOrCreateApplicationSpecificData(BANNED_EVENTS)
 	tag := event.Tags.FindWithValue("event", id.Hex())
 
@@ -73,6 +132,18 @@ func (m *ManagementStore) EventIsBanned(id nostr.ID) bool {
 // Internal banned pubkeys list
 
 func (m *ManagementStore) GetBannedPubkeyItems() []nip86.PubKeyReason {
+	if m.cachesWarmed {
+		items := make([]nip86.PubKeyReason, 0)
+		m.bannedPubkeys.Range(func(key, value any) bool {
+			items = append(items, nip86.PubKeyReason{
+				PubKey: key.(nostr.PubKey),
+				Reason: value.(string),
+			})
+			return true
+		})
+		return items
+	}
+
 	event := m.Events.GetOrCreateApplicationSpecificData(BANNED_PUBKEYS)
 
 	items := make([]nip86.PubKeyReason, 0)
@@ -98,6 +169,7 @@ func (m *ManagementStore) AddBannedPubkey(pubkey nostr.PubKey, reason string) er
 		}
 	}
 
+	m.bannedPubkeys.Store(pubkey, reason)
 	return nil
 }
 
@@ -115,10 +187,16 @@ func (m *ManagementStore) RemoveBannedPubkey(pubkey nostr.PubKey) error {
 		}
 	}
 
+	m.bannedPubkeys.Delete(pubkey)
 	return nil
 }
 
 func (m *ManagementStore) PubkeyIsBanned(pubkey nostr.PubKey) bool {
+	if m.cachesWarmed {
+		_, found := m.bannedPubkeys.Load(pubkey)
+		return found
+	}
+
 	event := m.Events.GetOrCreateApplicationSpecificData(BANNED_PUBKEYS)
 	tag := event.Tags.FindWithValue("banned", pubkey.Hex())
 
@@ -152,6 +230,15 @@ func (m *ManagementStore) GetAdmins() []nostr.PubKey {
 // Membership
 
 func (m *ManagementStore) GetMembers() []nostr.PubKey {
+	if m.cachesWarmed {
+		pubkeys := make([]nostr.PubKey, 0)
+		m.relayMembers.Range(func(key, _ any) bool {
+			pubkeys = append(pubkeys, key.(nostr.PubKey))
+			return true
+		})
+		return pubkeys
+	}
+
 	pubkeys := make([]nostr.PubKey, 0)
 	for tag := range m.Events.GetOrCreateRelayMembersList().Tags.FindAll("member") {
 		pubkey, err := nostr.PubKeyFromHex(tag[1])
@@ -165,6 +252,11 @@ func (m *ManagementStore) GetMembers() []nostr.PubKey {
 }
 
 func (m *ManagementStore) IsMember(pubkey nostr.PubKey) bool {
+	if m.cachesWarmed {
+		_, found := m.relayMembers.Load(pubkey)
+		return found
+	}
+
 	return m.Events.GetOrCreateRelayMembersList().Tags.FindWithValue("member", pubkey.Hex()) != nil
 }
 
@@ -193,6 +285,7 @@ func (m *ManagementStore) AddMember(pubkey nostr.PubKey) error {
 		}
 	}
 
+	m.relayMembers.Store(pubkey, struct{}{})
 	return nil
 }
 
@@ -221,9 +314,9 @@ func (m *ManagementStore) RemoveMember(pubkey nostr.PubKey) error {
 		if err := m.Events.SignAndStoreEvent(&membersEvent, true); err != nil {
 			return err
 		}
-
 	}
 
+	m.relayMembers.Delete(pubkey)
 	return nil
 }
 

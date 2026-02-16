@@ -110,6 +110,11 @@ func MakeInstance(filename string) (*Instance, error) {
 		log.Fatal("Failed to initialize event store: ", err)
 	}
 
+	// Warm caches
+
+	instance.Management.WarmCaches()
+	instance.Groups.WarmCaches()
+
 	// Enable extra functionality
 
 	if config.Blossom.Enabled {
@@ -407,6 +412,7 @@ func (instance *Instance) OnEventSaved(ctx context.Context, event nostr.Event) {
 	}
 
 	if event.Kind == nostr.KindSimpleGroupCreateGroup {
+		instance.Groups.creatorCache.Store(h, event.PubKey)
 		instance.Groups.UpdateMetadata(event)
 		instance.Groups.AddMember(h, event.PubKey) // Add creator as member
 		instance.Groups.UpdateMembersList(h)
