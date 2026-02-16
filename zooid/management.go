@@ -335,8 +335,13 @@ func (m *ManagementStore) BanPubkey(pubkey nostr.PubKey, reason string) error {
 		Authors: []nostr.PubKey{pubkey},
 	}
 
+	// Collect IDs first to avoid holding the DB connection during deletion
+	var toDelete []nostr.ID
 	for event := range m.Events.QueryEvents(filter, 0) {
-		m.Events.DeleteEvent(event.ID)
+		toDelete = append(toDelete, event.ID)
+	}
+	for _, id := range toDelete {
+		m.Events.DeleteEvent(id)
 	}
 
 	return nil

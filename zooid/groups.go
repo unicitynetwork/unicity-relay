@@ -236,10 +236,15 @@ func (g *GroupStore) DeleteGroup(h string) {
 	}
 
 	for _, filter := range filters {
+		// Collect IDs first to avoid holding the DB connection during deletion
+		var toDelete []nostr.ID
 		for event := range g.Events.QueryEvents(filter, 0) {
 			if event.Kind != nostr.KindSimpleGroupDeleteGroup {
-				g.Events.DeleteEvent(event.ID)
+				toDelete = append(toDelete, event.ID)
 			}
+		}
+		for _, id := range toDelete {
+			g.Events.DeleteEvent(id)
 		}
 	}
 
