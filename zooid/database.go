@@ -19,6 +19,10 @@ func GetDb() *sql.DB {
 			log.Fatal("Failed to open database: %w", err)
 		}
 
+		// SQLite allows only one writer at a time; serializing prevents
+		// WAL lock contention, especially on network filesystems (EFS).
+		newDb.SetMaxOpenConns(1)
+
 		db = newDb
 	})
 

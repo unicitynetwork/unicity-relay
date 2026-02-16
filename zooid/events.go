@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"iter"
-	"log"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/eventstore"
@@ -106,11 +105,6 @@ func (events *EventStore) QueryEvents(filter nostr.Filter, maxLimit int) iter.Se
 		if maxLimit > 0 && maxLimit < filter.Limit {
 			filter.Limit = maxLimit
 		}
-
-		// Debug: log filter and SQL
-		log.Printf("QueryEvents filter: kinds=%v tags=%v", filter.Kinds, filter.Tags)
-		sql, args, _ := events.buildSelectQuery(filter).ToSql()
-		log.Printf("QueryEvents SQL: %s args=%v", sql, args)
 
 		rows, err := events.buildSelectQuery(filter).RunWith(GetDb()).Query()
 		if err != nil {
@@ -282,19 +276,20 @@ func (events *EventStore) SaveEvent(evt nostr.Event) error {
 		return fmt.Errorf("failed to save event '%s': %w", evt.ID, err)
 	}
 
-	// Insert single-letter tags into event_tags table
+	// Insert single-letter tags into event_tags table (batched)
+	tagQb := squirrel.Insert(events.Schema.Prefix("event_tags")).
+		Columns("event_id", "key", "value")
+
+	hasTags := false
 	for _, tag := range evt.Tags {
 		if len(tag) >= 2 && len(tag[0]) == 1 {
-			tagQb := squirrel.Insert(events.Schema.Prefix("event_tags")).
-				Columns("event_id", "key", "value").
-				Values(evt.ID.Hex(), tag[0], tag[1])
-
-			_, err := tagQb.RunWith(GetDb()).Exec()
-			if err != nil {
-				// Log error but don't fail the entire save operation
-				continue
-			}
+			tagQb = tagQb.Values(evt.ID.Hex(), tag[0], tag[1])
+			hasTags = true
 		}
+	}
+
+	if hasTags {
+		_, _ = tagQb.RunWith(GetDb()).Exec()
 	}
 
 	return nil

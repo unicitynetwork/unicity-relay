@@ -275,8 +275,6 @@ func (instance *Instance) DeleteEvent(ctx context.Context, id nostr.ID) error {
 func (instance *Instance) OnRequest(ctx context.Context, filter nostr.Filter) (reject bool, msg string) {
 	pubkey, ok := khatru.GetAuthed(ctx)
 
-	log.Printf("OnRequest: kinds=%v tags=%v authed=%v", filter.Kinds, filter.Tags, ok)
-
 	if !ok {
 		return true, "auth-required: authentication is required for access"
 	}
@@ -329,9 +327,7 @@ func (instance *Instance) QueryStored(ctx context.Context, filter nostr.Filter) 
 				}
 
 				if instance.Groups.IsGroupEvent(event) {
-					canRead := instance.Groups.CanRead(pubkey, event)
-					if !canRead {
-						log.Printf("QueryStored: filtered out event %s kind=%d (CanRead=false)", event.ID, event.Kind)
+					if !instance.Groups.CanRead(pubkey, event) {
 						continue
 					}
 				}
