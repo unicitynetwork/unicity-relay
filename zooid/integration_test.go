@@ -17,6 +17,8 @@ import (
 	"fiatjaf.com/nostr"
 	"github.com/coder/websocket"
 	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/network"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
@@ -75,7 +77,21 @@ var (
 
 type relayContainer struct {
 	testcontainers.Container
-	URI string
+	URI     string
+	network *testcontainers.DockerNetwork
+	pgC     testcontainers.Container
+}
+
+func (rc *relayContainer) Cleanup(ctx context.Context) {
+	if rc.Container != nil {
+		rc.Container.Terminate(ctx)
+	}
+	if rc.pgC != nil {
+		rc.pgC.Terminate(ctx)
+	}
+	if rc.network != nil {
+		rc.network.Remove(ctx)
+	}
 }
 
 type relayConfig struct {
@@ -101,10 +117,40 @@ func setupRelayWithConfig(ctx context.Context, t *testing.T, cfg relayConfig) *r
 		return "false"
 	}
 
+	// Create a Docker network for relay <-> PostgreSQL communication
+	net, err := network.New(ctx)
+	if err != nil {
+		t.Fatalf("Failed to create Docker network: %v", err)
+	}
+
+	pgAlias := "testpg"
+
+	// Start PostgreSQL container on the shared network
+	pgContainer, err := postgres.Run(ctx, "postgres:16-alpine",
+		postgres.WithDatabase("zooid_integration"),
+		postgres.WithUsername("test"),
+		postgres.WithPassword("test"),
+		network.WithNetwork([]string{pgAlias}, net),
+		testcontainers.WithWaitStrategy(
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).
+				WithStartupTimeout(30*time.Second),
+		),
+	)
+	if err != nil {
+		net.Remove(ctx)
+		t.Fatalf("Failed to start PostgreSQL container: %v", err)
+	}
+
+	// DATABASE_URL for the relay container (uses the Docker network alias)
+	databaseURL := fmt.Sprintf("postgres://test:test@%s:5432/zooid_integration?sslmode=disable", pgAlias)
+
 	req := testcontainers.ContainerRequest{
 		Image:        image,
 		ExposedPorts: []string{"3334/tcp"},
+		Networks:     []string{net.Name},
 		Env: map[string]string{
+			"DATABASE_URL":                      databaseURL,
 			"RELAY_HOST":                        "localhost",
 			"RELAY_SECRET":                      relaySecret.Hex(),
 			"RELAY_PUBKEY":                      adminPubkey.Hex(),
@@ -121,6 +167,8 @@ func setupRelayWithConfig(ctx context.Context, t *testing.T, cfg relayConfig) *r
 		Started:          true,
 	})
 	if err != nil {
+		pgContainer.Terminate(ctx)
+		net.Remove(ctx)
 		t.Fatalf("Failed to start relay container: %v", err)
 	}
 
@@ -152,6 +200,8 @@ func setupRelayWithConfig(ctx context.Context, t *testing.T, cfg relayConfig) *r
 	return &relayContainer{
 		Container: container,
 		URI:       uri,
+		network:   net,
+		pgC:       pgContainer,
 	}
 }
 
@@ -359,7 +409,7 @@ func TestIntegration_RelayAdminListPublished(t *testing.T) {
 	ctx := context.Background()
 
 	relay := setupRelay(ctx, t, true)
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	client := newNostrClient(ctx, t, relay.URI, adminSecret)
 	defer client.close()
@@ -417,7 +467,7 @@ func TestIntegration_AdminCanCreateGroup(t *testing.T) {
 	ctx := context.Background()
 
 	relay := setupRelay(ctx, t, true)
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	client := newNostrClient(ctx, t, relay.URI, adminSecret)
 	defer client.close()
@@ -510,7 +560,7 @@ func TestIntegration_NonAdminCannotCreateGroup(t *testing.T) {
 	ctx := context.Background()
 
 	relay := setupRelay(ctx, t, true) // admin_create_only = true
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	client := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
 	defer client.close()
@@ -543,7 +593,7 @@ func TestIntegration_AdminCanDeleteGroup(t *testing.T) {
 	ctx := context.Background()
 
 	relay := setupRelay(ctx, t, true)
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	client := newNostrClient(ctx, t, relay.URI, adminSecret)
 	defer client.close()
@@ -599,7 +649,7 @@ func TestIntegration_NonAdminCanCreateGroupWhenNotRestricted(t *testing.T) {
 	ctx := context.Background()
 
 	relay := setupRelay(ctx, t, false) // admin_create_only = false
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	client := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
 	defer client.close()
@@ -633,7 +683,7 @@ func TestIntegration_AdminCanCreatePrivateGroup(t *testing.T) {
 		adminCreateOnly:  false,
 		privateAdminOnly: true,
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	client := newNostrClient(ctx, t, relay.URI, adminSecret)
 	defer client.close()
@@ -676,7 +726,7 @@ func TestIntegration_NonAdminCannotCreatePrivateGroup(t *testing.T) {
 		adminCreateOnly:  false, // Allow public group creation by anyone
 		privateAdminOnly: true,  // But private groups are admin-only
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	client := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
 	defer client.close()
@@ -712,7 +762,7 @@ func TestIntegration_NonAdminCanCreatePublicGroupWhenPrivateRestricted(t *testin
 		adminCreateOnly:  false, // Allow public group creation by anyone
 		privateAdminOnly: true,  // But private groups are admin-only
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	client := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
 	defer client.close()
@@ -744,7 +794,7 @@ func TestIntegration_NonAdminCanCreatePrivateGroupWhenNotRestricted(t *testing.T
 		adminCreateOnly:  false, // Allow group creation by anyone
 		privateAdminOnly: false, // Allow private group creation by anyone
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	client := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
 	defer client.close()
@@ -776,7 +826,7 @@ func TestIntegration_AdminCanSeePrivateGroupContent(t *testing.T) {
 		adminCreateOnly:  false,
 		privateAdminOnly: true,
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
 	defer adminClient.close()
@@ -834,7 +884,7 @@ func TestIntegration_NonMemberCannotSeePrivateGroupContent(t *testing.T) {
 		adminCreateOnly:  false,
 		privateAdminOnly: true,
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	// Admin creates and posts to private group
 	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
@@ -895,7 +945,7 @@ func TestIntegration_AdminCanDeletePrivateGroup(t *testing.T) {
 		adminCreateOnly:  false,
 		privateAdminOnly: true,
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	client := newNostrClient(ctx, t, relay.URI, adminSecret)
 	defer client.close()
@@ -955,7 +1005,7 @@ func TestIntegration_AdminInvitesUserToPrivateGroup(t *testing.T) {
 		adminCreateOnly:  false,
 		privateAdminOnly: true,
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	// Admin creates private group
 	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
@@ -1043,7 +1093,7 @@ func TestIntegration_AdminKicksUserFromGroup(t *testing.T) {
 		adminCreateOnly:  false,
 		privateAdminOnly: true,
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	// Admin creates private group and adds user
 	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
@@ -1155,7 +1205,7 @@ func TestIntegration_KickedUserCanRejoin(t *testing.T) {
 		adminCreateOnly:  false,
 		privateAdminOnly: true,
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
 
@@ -1286,7 +1336,7 @@ func TestIntegration_UserCanPostAfterInvite(t *testing.T) {
 		adminCreateOnly:  false,
 		privateAdminOnly: true,
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	// Admin creates group and invites user
 	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
@@ -1374,7 +1424,7 @@ func TestIntegration_KickedUserCannotPost(t *testing.T) {
 		adminCreateOnly:  false,
 		privateAdminOnly: true,
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
 
@@ -1464,7 +1514,7 @@ func TestIntegration_UserCannotJoinPrivateGroupWithoutInvite(t *testing.T) {
 		adminCreateOnly:  false,
 		privateAdminOnly: true,
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	// Admin creates a private group
 	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
@@ -1518,7 +1568,7 @@ func TestIntegration_UserCannotJoinPrivateGroupWithWrongInvite(t *testing.T) {
 		adminCreateOnly:  false,
 		privateAdminOnly: true,
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	// Admin creates a private group
 	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
@@ -1588,7 +1638,7 @@ func TestIntegration_UserCanJoinPrivateGroupWithValidInvite(t *testing.T) {
 		adminCreateOnly:  false,
 		privateAdminOnly: true,
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	// Admin creates a private group
 	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
@@ -1686,7 +1736,7 @@ func TestIntegration_PublicGroupDoesNotRequireInvite(t *testing.T) {
 		adminCreateOnly:  false,
 		privateAdminOnly: true,
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	// Admin creates a public group (closed but not private/hidden)
 	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
@@ -1738,7 +1788,7 @@ func TestIntegration_RelayAdminCannotSeePrivateGroupWhenAccessDisabled(t *testin
 		privateAdminOnly:        false,
 		privateRelayAdminAccess: false, // Relay admins cannot see private groups
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	// Non-admin creates a private group
 	userClient := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
@@ -1800,7 +1850,7 @@ func TestIntegration_RelayAdminCanSeePrivateGroupWhenAccessEnabled(t *testing.T)
 		privateAdminOnly:        false,
 		privateRelayAdminAccess: true, // Relay admins CAN see private groups
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	// Non-admin creates a private group
 	userClient := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
@@ -1862,7 +1912,7 @@ func TestIntegration_RelayAdminCannotModeratePrivateGroupWhenAccessDisabled(t *t
 		privateAdminOnly:        false,
 		privateRelayAdminAccess: false,
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	// Non-admin creates a private group
 	userClient := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
@@ -1913,7 +1963,7 @@ func TestIntegration_CreatorCanModerateOwnPrivateGroup(t *testing.T) {
 		privateAdminOnly:        false,
 		privateRelayAdminAccess: false,
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	// Non-admin creates a private group
 	userClient := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
@@ -1961,7 +2011,7 @@ func TestIntegration_RelayAdminCanStillModeratePublicGroups(t *testing.T) {
 		privateAdminOnly:        false,
 		privateRelayAdminAccess: false, // Even with this off, public groups should still be manageable
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	// Non-admin creates a public group
 	userClient := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
@@ -2013,7 +2063,7 @@ func TestIntegration_CachedMembershipGrantsAndRevokesAccess(t *testing.T) {
 		adminCreateOnly:  false,
 		privateAdminOnly: true,
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
 
@@ -2151,7 +2201,7 @@ func TestIntegration_CachedMetadataReflectsUpdates(t *testing.T) {
 		adminCreateOnly:  false,
 		privateAdminOnly: true,
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
 	defer adminClient.close()
@@ -2226,7 +2276,7 @@ func TestIntegration_CachedDeleteGroupClearsAccess(t *testing.T) {
 		adminCreateOnly:  false,
 		privateAdminOnly: true,
 	})
-	defer relay.Container.Terminate(ctx)
+	defer relay.Cleanup(ctx)
 
 	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
 

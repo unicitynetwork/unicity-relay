@@ -2,7 +2,6 @@ package zooid
 
 import (
 	"fmt"
-	"github.com/Masterminds/squirrel"
 	"log"
 	"sync"
 )
@@ -15,7 +14,7 @@ var (
 type KeyValueStore struct{}
 
 func GetKeyValueStore() *KeyValueStore {
-	dbOnce.Do(func() {
+	kvOnce.Do(func() {
 		kv = &KeyValueStore{}
 		kv.Migrate()
 	})
@@ -24,24 +23,25 @@ func GetKeyValueStore() *KeyValueStore {
 }
 
 func (kv *KeyValueStore) Migrate() {
-	sql := `
-	CREATE TABLE IF NOT EXISTS kv (
-		key TEXT PRIMARY KEY,
-		value TEXT NOT NULL
-	);
+	statements := []string{
+		`CREATE TABLE IF NOT EXISTS kv (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_kv_key ON kv(key)`,
+	}
 
-	CREATE INDEX IF NOT EXISTS idx_kv_key ON kv(key);
-	`
-
-	if _, err := GetDb().Exec(sql); err != nil {
-		log.Fatal("failed to migrate database: %w", err)
+	for _, stmt := range statements {
+		if _, err := GetDb().Exec(stmt); err != nil {
+			log.Fatalf("failed to migrate database: %v", err)
+		}
 	}
 }
 
 func (kv *KeyValueStore) Get(key string) (string, error) {
-	rows, err := squirrel.Select("value").
+	rows, err := sb.Select("value").
 		From("kv").
-		Where(squirrel.Eq{"key": key}).
+		Where("key = ?", key).
 		RunWith(GetDb()).
 		Query()
 
@@ -66,10 +66,10 @@ func (kv *KeyValueStore) Get(key string) (string, error) {
 }
 
 func (kv *KeyValueStore) Set(key string, value string) error {
-	_, err := squirrel.Insert("kv").
+	_, err := sb.Insert("kv").
 		Columns("key", "value").
 		Values(key, value).
-		Suffix("ON CONFLICT(key) DO UPDATE SET value = excluded.value").
+		Suffix("ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value").
 		RunWith(GetDb()).
 		Exec()
 

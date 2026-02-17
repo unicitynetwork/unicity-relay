@@ -26,11 +26,6 @@ func Dispatch(hostname string) (*Instance, bool) {
 }
 
 func Start() {
-	dataDir := Env("DATA")
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
-		log.Fatalf("Failed to create data directory: %v", err)
-	}
-
 	mediaDir := Env("MEDIA")
 	if err := os.MkdirAll(mediaDir, 0755); err != nil {
 		log.Fatalf("Failed to create media directory: %v", err)
