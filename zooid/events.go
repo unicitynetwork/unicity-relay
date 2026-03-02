@@ -1,94 +1,95 @@
 package zooid
 
 import (
+	"context"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"iter"
+	"log"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/eventstore"
 	"fiatjaf.com/nostr/khatru"
 	"github.com/Masterminds/squirrel"
-	_ "github.com/mattn/go-sqlite3"
 )
 
+// Global Squirrel builder with Dollar placeholder format for PostgreSQL
+var sb = squirrel.StatementBuilder.PlaceholderFormat(squirrel.Dollar)
+
 type EventStore struct {
-	Relay        *khatru.Relay
-	Config       *Config
-	Schema       *Schema
-	FTSAvailable bool
+	Relay  *khatru.Relay
+	Config *Config
+	Schema *Schema
 }
 
 var _ eventstore.Store = (*EventStore)(nil)
 
 func (events *EventStore) Init() error {
-	// Create basic schema first
-	basicSchema := events.Schema.Render(`
-	CREATE TABLE IF NOT EXISTS {{.Name}}__events (
-		id TEXT PRIMARY KEY,
-		created_at INTEGER NOT NULL,
-		kind INTEGER NOT NULL,
-		pubkey TEXT NOT NULL,
-		content TEXT NOT NULL,
-		tags TEXT NOT NULL,
-		sig TEXT NOT NULL
-	);
-
-	CREATE INDEX IF NOT EXISTS {{.Name}}__idx_events_created_at ON {{.Name}}__events(created_at);
-	CREATE INDEX IF NOT EXISTS {{.Name}}__idx_events_kind ON {{.Name}}__events(kind);
-	CREATE INDEX IF NOT EXISTS {{.Name}}__idx_events_pubkey ON {{.Name}}__events(pubkey);
-	CREATE INDEX IF NOT EXISTS {{.Name}}__idx_events_kind_pubkey ON {{.Name}}__events(kind, pubkey);
-	CREATE INDEX IF NOT EXISTS {{.Name}}__idx_events_kind_pubkey_created_at ON {{.Name}}__events(kind, pubkey, created_at DESC);
-
-	CREATE TABLE IF NOT EXISTS {{.Name}}__event_tags (
-		event_id TEXT NOT NULL,
-		key TEXT NOT NULL,
-		value TEXT NOT NULL,
-		FOREIGN KEY (event_id) REFERENCES {{.Name}}__events(id) ON DELETE CASCADE
-	);
-
-	CREATE INDEX IF NOT EXISTS {{.Name}}__idx_event_tags_event_id ON {{.Name}}__event_tags(event_id);
-	CREATE INDEX IF NOT EXISTS {{.Name}}__idx_event_tags_key ON {{.Name}}__event_tags(key);
-	CREATE INDEX IF NOT EXISTS {{.Name}}__idx_event_tags_key_value ON {{.Name}}__event_tags(key, value);
-	`)
-
-	if _, err := GetDb().Exec(basicSchema); err != nil {
-		return fmt.Errorf("failed to create schema: %w", err)
+	statements := []string{
+		events.Schema.Render(`
+			CREATE TABLE IF NOT EXISTS {{.Name}}__events (
+				id TEXT PRIMARY KEY,
+				created_at BIGINT NOT NULL,
+				kind INTEGER NOT NULL,
+				pubkey TEXT NOT NULL,
+				content TEXT NOT NULL,
+				tags TEXT NOT NULL,
+				sig TEXT NOT NULL
+			)`),
+		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_events_created_at ON {{.Name}}__events(created_at)`),
+		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_events_kind ON {{.Name}}__events(kind)`),
+		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_events_pubkey ON {{.Name}}__events(pubkey)`),
+		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_events_kind_pubkey ON {{.Name}}__events(kind, pubkey)`),
+		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_events_kind_pubkey_created_at ON {{.Name}}__events(kind, pubkey, created_at DESC)`),
+		events.Schema.Render(`
+			CREATE TABLE IF NOT EXISTS {{.Name}}__event_tags (
+				event_id TEXT NOT NULL,
+				key TEXT NOT NULL,
+				value TEXT NOT NULL,
+				FOREIGN KEY (event_id) REFERENCES {{.Name}}__events(id) ON DELETE CASCADE
+			)`),
+		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_event_tags_event_id ON {{.Name}}__event_tags(event_id)`),
+		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_event_tags_key ON {{.Name}}__event_tags(key)`),
+		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_event_tags_key_value ON {{.Name}}__event_tags(key, value)`),
 	}
 
-	// Try to create FTS5 schema - if it fails, continue without it
-	ftsSchema := `
-	CREATE VIRTUAL TABLE IF NOT EXISTS {{.Name}}__events_fts USING fts5(
-		content,
-		content='{{.Name}}__events',
-		content_rowid='rowid'
-	);
-
-	CREATE TRIGGER IF NOT EXISTS {{.Name}}__events_ai AFTER INSERT ON {{.Name}}__events BEGIN
-		INSERT INTO {{.Name}}__events_fts(rowid, content) VALUES (new.rowid, new.content);
-	END;
-
-	CREATE TRIGGER IF NOT EXISTS {{.Name}}__events_ad AFTER DELETE ON {{.Name}}__events BEGIN
-		INSERT INTO {{.Name}}__events_fts({{.Name}}__events_fts, rowid, content)
-		VALUES('delete', old.rowid, old.content);
-	END;
-
-	CREATE TRIGGER IF NOT EXISTS {{.Name}}__events_au AFTER UPDATE ON {{.Name}}__events BEGIN
-		INSERT INTO {{.Name}}__events_fts({{.Name}}__events_fts, rowid, content)
-		VALUES('delete', old.rowid, old.content);
-		INSERT INTO {{.Name}}__events_fts(rowid, content)
-		VALUES (new.rowid, new.content);
-	END;
-	`
-
-	if _, err := GetDb().Exec(ftsSchema); err != nil {
-		// FTS5 not available, continue without full-text search
-		events.FTSAvailable = false
-	} else {
-		events.FTSAvailable = true
+	for _, stmt := range statements {
+		if _, err := GetDb().Exec(stmt); err != nil {
+			return fmt.Errorf("schema init failed: %w", err)
+		}
 	}
 
+	if err := events.initFTS(); err != nil {
+		return fmt.Errorf("FTS init failed: %w", err)
+	}
+	return nil
+}
+
+func (events *EventStore) initFTS() error {
+	ftsStatements := []string{
+		events.Schema.Render(`ALTER TABLE {{.Name}}__events ADD COLUMN IF NOT EXISTS search_vector tsvector`),
+		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_events_search ON {{.Name}}__events USING GIN(search_vector)`),
+		events.Schema.Render(`
+			CREATE OR REPLACE FUNCTION {{.Name}}_update_search_vector() RETURNS trigger AS $$
+			BEGIN
+				NEW.search_vector := to_tsvector('english', COALESCE(NEW.content, ''));
+				RETURN NEW;
+			END;
+			$$ LANGUAGE plpgsql`),
+		events.Schema.Render(`DROP TRIGGER IF EXISTS {{.Name}}_events_search_update ON {{.Name}}__events`),
+		events.Schema.Render(`
+			CREATE TRIGGER {{.Name}}_events_search_update
+				BEFORE INSERT OR UPDATE ON {{.Name}}__events
+				FOR EACH ROW EXECUTE FUNCTION {{.Name}}_update_search_vector()`),
+	}
+
+	for _, stmt := range ftsStatements {
+		if _, err := GetDb().Exec(stmt); err != nil {
+			return fmt.Errorf("statement failed: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -97,17 +98,22 @@ func (events *EventStore) Close() {
 }
 
 func (events *EventStore) QueryEvents(filter nostr.Filter, maxLimit int) iter.Seq[nostr.Event] {
+	return events.queryEventsWith(GetDb(), filter, maxLimit)
+}
+
+func (events *EventStore) queryEventsWith(runner squirrel.BaseRunner, filter nostr.Filter, maxLimit int) iter.Seq[nostr.Event] {
 	return func(yield func(nostr.Event) bool) {
 		if filter.LimitZero {
 			return
 		}
 
-		if maxLimit > 0 && maxLimit < filter.Limit {
+		if maxLimit > 0 && (filter.Limit == 0 || maxLimit < filter.Limit) {
 			filter.Limit = maxLimit
 		}
 
-		rows, err := events.buildSelectQuery(filter).RunWith(GetDb()).Query()
+		rows, err := events.buildSelectQuery(filter).RunWith(runner).Query()
 		if err != nil {
+			log.Printf("QueryEvents query error: %v", err)
 			return
 		}
 		defer rows.Close()
@@ -157,21 +163,21 @@ func (events *EventStore) QueryEvents(filter nostr.Filter, maxLimit int) iter.Se
 				return
 			}
 		}
+
+		if err := rows.Err(); err != nil {
+			log.Printf("QueryEvents row iteration error: %v", err)
+		}
 	}
 }
 
 func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectBuilder {
-	qb := squirrel.Select("id", "created_at", "kind", "pubkey", "content", "tags", "sig").
+	qb := sb.Select("id", "created_at", "kind", "pubkey", "content", "tags", "sig").
 		From(events.Schema.Prefix("events")).
 		OrderBy("created_at DESC")
 
-	// Handle search with FTS (if available)
-	if filter.Search != "" && events.FTSAvailable {
-		qb = qb.Join(events.Schema.Render("{{.Name}}__events_fts ON {{.Name}}__events.rowid = {{.Name}}__events_fts.rowid")).
-			Where(squirrel.Eq{"events_fts": filter.Search})
-	} else if filter.Search != "" {
-		// Fallback to LIKE search if FTS not available
-		qb = qb.Where(squirrel.Like{"content": "%" + filter.Search + "%"})
+	// Handle search with tsvector FTS
+	if filter.Search != "" {
+		qb = qb.Where("search_vector @@ plainto_tsquery('english', ?)", filter.Search)
 	}
 
 	if len(filter.IDs) > 0 {
@@ -220,6 +226,9 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectB
 			tagValueInterfaces[i] = tagValue
 		}
 
+		// Use Question format for the sub-query so that when its SQL is embedded
+		// into the outer Dollar-format query, the ? placeholders get properly
+		// renumbered to $N by the outer builder.
 		subQuery := squirrel.Select("event_id").
 			From(events.Schema.Prefix("event_tags")).
 			Where(squirrel.Eq{"key": tagKey}).
@@ -237,28 +246,39 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectB
 }
 
 func (events *EventStore) DeleteEvent(id nostr.ID) error {
-	_, err := squirrel.Delete(events.Schema.Prefix("events")).Where(squirrel.Eq{"id": id.Hex()}).RunWith(GetDb()).Exec()
+	return events.deleteEventWith(GetDb(), id)
+}
 
+func (events *EventStore) deleteEventWith(runner squirrel.BaseRunner, id nostr.ID) error {
+	_, err := sb.Delete(events.Schema.Prefix("events")).Where(squirrel.Eq{"id": id.Hex()}).RunWith(runner).Exec()
 	return err
 }
 
 func (events *EventStore) SaveEvent(evt nostr.Event) error {
-	// Check if event already exists
-	var existingID string
-	qb := squirrel.Select("id").From(events.Schema.Prefix("events")).Where(squirrel.Eq{"id": evt.ID.Hex()})
-	err := qb.RunWith(GetDb()).QueryRow().Scan(&existingID)
-	if err == nil {
-		return eventstore.ErrDupEvent
+	tx, err := GetDb().Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	if err := events.saveEventWith(tx, evt); err != nil {
+		return err
 	}
 
-	// Serialize tags to JSON
+	return tx.Commit()
+}
+
+// saveEventWith inserts an event and its tags using the provided runner.
+// The caller is responsible for transaction management.
+func (events *EventStore) saveEventWith(runner squirrel.BaseRunner, evt nostr.Event) error {
 	tagsJSON, err := json.Marshal(evt.Tags)
 	if err != nil {
 		return fmt.Errorf("failed to marshal tags: %w", err)
 	}
 
-	// Insert the event
-	insertQb := squirrel.Insert(events.Schema.Prefix("events")).
+	// Insert the event, using ON CONFLICT to atomically detect duplicates.
+	// This is race-safe with PostgreSQL's concurrent connections (unlike SELECT-then-INSERT).
+	insertQb := sb.Insert(events.Schema.Prefix("events")).
 		Columns("id", "created_at", "kind", "pubkey", "content", "tags", "sig").
 		Values(
 			evt.ID.Hex(),
@@ -268,16 +288,21 @@ func (events *EventStore) SaveEvent(evt nostr.Event) error {
 			evt.Content,
 			string(tagsJSON),
 			hex.EncodeToString(evt.Sig[:]),
-		)
+		).
+		Suffix("ON CONFLICT(id) DO NOTHING")
 
-	_, err = insertQb.RunWith(GetDb()).Exec()
-
+	result, err := insertQb.RunWith(runner).Exec()
 	if err != nil {
 		return fmt.Errorf("failed to save event '%s': %w", evt.ID, err)
 	}
 
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		return eventstore.ErrDupEvent
+	}
+
 	// Insert single-letter tags into event_tags table (batched)
-	tagQb := squirrel.Insert(events.Schema.Prefix("event_tags")).
+	tagQb := sb.Insert(events.Schema.Prefix("event_tags")).
 		Columns("event_id", "key", "value")
 
 	hasTags := false
@@ -289,13 +314,28 @@ func (events *EventStore) SaveEvent(evt nostr.Event) error {
 	}
 
 	if hasTags {
-		_, _ = tagQb.RunWith(GetDb()).Exec()
+		if _, err := tagQb.RunWith(runner).Exec(); err != nil {
+			return fmt.Errorf("failed to save tags for event '%s': %w", evt.ID, err)
+		}
 	}
 
 	return nil
 }
 
 func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
+	// Use a serializable transaction so the read-decide-write-delete cycle is
+	// atomic. Without this, two concurrent goroutines could both read "no
+	// existing event", both insert, and leave duplicate replaceable events.
+	// PostgreSQL may return a serialization error under contention; in that
+	// case the client can simply retry the publish.
+	tx, err := GetDb().BeginTx(context.Background(), &sql.TxOptions{
+		Isolation: sql.LevelSerializable,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
 	filter := nostr.Filter{Kinds: []nostr.Kind{evt.Kind}, Authors: []nostr.PubKey{evt.PubKey}}
 	if evt.Kind.IsAddressable() {
 		filter.Tags = nostr.TagMap{"d": []string{evt.Tags.GetD()}}
@@ -303,7 +343,7 @@ func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
 
 	shouldSave := true
 	shouldDelete := make([]nostr.ID, 0)
-	for previous := range events.QueryEvents(filter, 1) {
+	for previous := range events.queryEventsWith(tx, filter, 0) {
 		if previous.CreatedAt <= evt.CreatedAt {
 			shouldDelete = append(shouldDelete, previous.ID)
 		} else {
@@ -312,25 +352,27 @@ func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
 	}
 
 	if shouldSave {
-		if err := events.SaveEvent(evt); err != nil && err != eventstore.ErrDupEvent {
+		if err := events.saveEventWith(tx, evt); err != nil && err != eventstore.ErrDupEvent {
 			return fmt.Errorf("failed to save: %w", err)
 		}
 	}
 
-	// Wait until the end to delete old events, just in case our new one doesn't save
 	for _, id := range shouldDelete {
-		events.DeleteEvent(id)
+		if err := events.deleteEventWith(tx, id); err != nil {
+			return fmt.Errorf("failed to delete old event: %w", err)
+		}
 	}
 
-	return nil
+	return tx.Commit()
 }
 
 func (events *EventStore) CountEvents(filter nostr.Filter) (uint32, error) {
-	// Build a count query based on the select query but with COUNT(*) instead
-	qb := events.buildSelectQuery(filter)
+	// Strip limit for a true total count; ORDER BY in the subquery is
+	// optimized away by PostgreSQL's planner inside COUNT(*).
+	filter.Limit = 0
+	qb := events.buildSelectQuery(filter).RemoveLimit()
 
-	// Convert the select query to a count query
-	countQb := squirrel.Select("COUNT(*)").FromSelect(qb, "subquery")
+	countQb := sb.Select("COUNT(*)").FromSelect(qb, "subquery")
 
 	var count uint32
 	err := countQb.RunWith(GetDb()).QueryRow().Scan(&count)

@@ -285,6 +285,27 @@ func TestEventStore_QueryEvents_Limit(t *testing.T) {
 	}
 }
 
+func TestEventStore_QueryEvents_MaxLimitCapsUnlimitedFilter(t *testing.T) {
+	store := createTestEventStore()
+	store.Init()
+
+	for i := 0; i < 5; i++ {
+		evt := createTestEvent(nostr.KindTextNote, "maxlimit test")
+		store.SaveEvent(evt)
+	}
+
+	// filter.Limit=0 means "no limit", but maxLimit=2 should cap it
+	filter := nostr.Filter{}
+	events := make([]nostr.Event, 0)
+	for evt := range store.QueryEvents(filter, 2) {
+		events = append(events, evt)
+	}
+
+	if len(events) != 2 {
+		t.Errorf("QueryEvents() with maxLimit=2 and no filter limit returned %d events, want 2", len(events))
+	}
+}
+
 func TestEventStore_QueryEvents_LimitZero(t *testing.T) {
 	store := createTestEventStore()
 	store.Init()
@@ -518,6 +539,130 @@ func TestEventStore_CountEvents(t *testing.T) {
 
 	if count != 2 {
 		t.Errorf("CountEvents() by metadata kind = %d, want 2", count)
+	}
+}
+
+func TestEventStore_CountEvents_IgnoresLimit(t *testing.T) {
+	store := createTestEventStore()
+	store.Init()
+
+	for i := 0; i < 5; i++ {
+		evt := createTestEvent(nostr.KindTextNote, "count test")
+		store.SaveEvent(evt)
+	}
+
+	// CountEvents should return total count even when filter has a Limit
+	filter := nostr.Filter{Kinds: []nostr.Kind{nostr.KindTextNote}, Limit: 2}
+	count, err := store.CountEvents(filter)
+	if err != nil {
+		t.Fatalf("CountEvents() error = %v", err)
+	}
+
+	if count != 5 {
+		t.Errorf("CountEvents() with Limit=2 should return 5 (total), got %d", count)
+	}
+}
+
+func TestEventStore_SaveEvent_TagsArePersisted(t *testing.T) {
+	store := createTestEventStore()
+	store.Init()
+
+	evt := nostr.Event{
+		Kind:      nostr.KindTextNote,
+		CreatedAt: nostr.Now(),
+		Content:   "tagged event",
+		Tags:      nostr.Tags{{"h", "group1"}, {"p", "user1"}, {"t", "topic"}},
+	}
+	evt.Sign(nostr.Generate())
+	if err := store.SaveEvent(evt); err != nil {
+		t.Fatalf("SaveEvent() error = %v", err)
+	}
+
+	// Verify each single-letter tag is queryable
+	for _, tag := range evt.Tags {
+		filter := nostr.Filter{Tags: nostr.TagMap{tag[0]: []string{tag[1]}}}
+		var found bool
+		for result := range store.QueryEvents(filter, 0) {
+			if result.ID == evt.ID {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("Event not found by tag %s=%s", tag[0], tag[1])
+		}
+	}
+}
+
+func TestEventStore_SaveEvent_DuplicateDoesNotCreateOrphanTags(t *testing.T) {
+	store := createTestEventStore()
+	store.Init()
+
+	evt := nostr.Event{
+		Kind:      nostr.KindTextNote,
+		CreatedAt: nostr.Now(),
+		Content:   "duplicate test",
+		Tags:      nostr.Tags{{"t", "dup"}},
+	}
+	evt.Sign(nostr.Generate())
+
+	// First save should succeed
+	err := store.SaveEvent(evt)
+	if err != nil {
+		t.Fatalf("First SaveEvent() error = %v", err)
+	}
+
+	// Second save should return duplicate error
+	err = store.SaveEvent(evt)
+	if err == nil {
+		t.Fatal("Second SaveEvent() should return duplicate error")
+	}
+
+	// Query by tag should still return exactly one event
+	filter := nostr.Filter{Tags: nostr.TagMap{"t": []string{"dup"}}}
+	var count int
+	for range store.QueryEvents(filter, 0) {
+		count++
+	}
+	if count != 1 {
+		t.Errorf("Expected 1 event for tag query after duplicate save, got %d", count)
+	}
+}
+
+func TestEventStore_DeleteEvent_CascadesTags(t *testing.T) {
+	store := createTestEventStore()
+	store.Init()
+
+	evt := nostr.Event{
+		Kind:      nostr.KindTextNote,
+		CreatedAt: nostr.Now(),
+		Content:   "cascade test",
+		Tags:      nostr.Tags{{"t", "cascade_test_unique"}},
+	}
+	evt.Sign(nostr.Generate())
+	store.SaveEvent(evt)
+
+	// Verify tag query finds the event
+	filter := nostr.Filter{Tags: nostr.TagMap{"t": []string{"cascade_test_unique"}}}
+	var count int
+	for range store.QueryEvents(filter, 0) {
+		count++
+	}
+	if count != 1 {
+		t.Fatalf("Expected 1 event before delete, got %d", count)
+	}
+
+	// Delete the event
+	if err := store.DeleteEvent(evt.ID); err != nil {
+		t.Fatalf("DeleteEvent() error = %v", err)
+	}
+
+	// Tag query should return nothing (tags cascaded)
+	count = 0
+	for range store.QueryEvents(filter, 0) {
+		count++
+	}
+	if count != 0 {
+		t.Errorf("Expected 0 events after delete (cascade), got %d", count)
 	}
 }
 

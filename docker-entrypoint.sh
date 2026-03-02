@@ -5,7 +5,6 @@ set -e
 # Generates config from environment variables if not present
 
 CONFIG_DIR="${CONFIG:-/app/config}"
-DATA_DIR="${DATA:-/app/data}"
 MEDIA_DIR="${MEDIA:-/app/media}"
 
 # Default values
@@ -21,7 +20,13 @@ GROUPS_PRIVATE_ADMIN_ONLY="${GROUPS_PRIVATE_ADMIN_ONLY:-true}"
 GROUPS_PRIVATE_RELAY_ADMIN_ACCESS="${GROUPS_PRIVATE_RELAY_ADMIN_ACCESS:-false}"
 
 # Create directories
-mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$MEDIA_DIR"
+mkdir -p "$CONFIG_DIR" "$MEDIA_DIR"
+
+# Validate DATABASE_URL
+if [ -z "$DATABASE_URL" ]; then
+    echo "ERROR: DATABASE_URL environment variable is required"
+    exit 1
+fi
 
 # Generate config file if it doesn't exist
 CONFIG_FILE="$CONFIG_DIR/$RELAY_HOST"
@@ -82,7 +87,6 @@ can_invite = true
 EOF
 
     echo "Config generated at: $CONFIG_FILE"
-    cat "$CONFIG_FILE"
 else
     echo "Using existing config: $CONFIG_FILE"
 fi
