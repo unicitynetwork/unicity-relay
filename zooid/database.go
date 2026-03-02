@@ -27,6 +27,10 @@ func GetDb() *sql.DB {
 			log.Fatalf("Failed to open database: %v", err)
 		}
 
+		if err := newDb.Ping(); err != nil {
+			log.Fatalf("Failed to connect to database: %v", err)
+		}
+
 		maxOpen := envInt("DB_MAX_OPEN_CONNS", 20)
 		maxIdle := envInt("DB_MAX_IDLE_CONNS", 5)
 		connMaxLife := envInt("DB_CONN_MAX_LIFETIME_SECS", 300)

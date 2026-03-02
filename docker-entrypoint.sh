@@ -87,7 +87,6 @@ can_invite = true
 EOF
 
     echo "Config generated at: $CONFIG_FILE"
-    cat "$CONFIG_FILE"
 else
     echo "Using existing config: $CONFIG_FILE"
 fi

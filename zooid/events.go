@@ -59,11 +59,13 @@ func (events *EventStore) Init() error {
 		}
 	}
 
-	events.initFTS()
+	if err := events.initFTS(); err != nil {
+		return fmt.Errorf("FTS init failed: %w", err)
+	}
 	return nil
 }
 
-func (events *EventStore) initFTS() {
+func (events *EventStore) initFTS() error {
 	ftsStatements := []string{
 		events.Schema.Render(`ALTER TABLE {{.Name}}__events ADD COLUMN IF NOT EXISTS search_vector tsvector`),
 		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_events_search ON {{.Name}}__events USING GIN(search_vector)`),
@@ -83,9 +85,10 @@ func (events *EventStore) initFTS() {
 
 	for _, stmt := range ftsStatements {
 		if _, err := GetDb().Exec(stmt); err != nil {
-			log.Printf("FTS init warning: %v", err)
+			return fmt.Errorf("statement failed: %w", err)
 		}
 	}
+	return nil
 }
 
 func (events *EventStore) Close() {
@@ -98,12 +101,13 @@ func (events *EventStore) QueryEvents(filter nostr.Filter, maxLimit int) iter.Se
 			return
 		}
 
-		if maxLimit > 0 && maxLimit < filter.Limit {
+		if maxLimit > 0 && (filter.Limit == 0 || maxLimit < filter.Limit) {
 			filter.Limit = maxLimit
 		}
 
 		rows, err := events.buildSelectQuery(filter).RunWith(GetDb()).Query()
 		if err != nil {
+			log.Printf("QueryEvents query error: %v", err)
 			return
 		}
 		defer rows.Close()
@@ -331,9 +335,10 @@ func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
 }
 
 func (events *EventStore) CountEvents(filter nostr.Filter) (uint32, error) {
-	// Strip limit so we get the true total count matching the filter
+	// Strip limit for a true total count; ORDER BY in the subquery is
+	// optimized away by PostgreSQL's planner inside COUNT(*).
 	filter.Limit = 0
-	qb := events.buildSelectQuery(filter)
+	qb := events.buildSelectQuery(filter).RemoveLimit()
 
 	countQb := sb.Select("COUNT(*)").FromSelect(qb, "subquery")
 

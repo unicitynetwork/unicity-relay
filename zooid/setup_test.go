@@ -31,19 +31,22 @@ func TestMain(m *testing.M) {
 	if err != nil {
 		log.Fatalf("Failed to start PostgreSQL container: %v", err)
 	}
-	defer pgContainer.Terminate(ctx)
 
 	connStr, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
+		pgContainer.Terminate(ctx)
 		log.Fatalf("Failed to get connection string: %v", err)
 	}
 
 	// Verify connection works before running tests
 	testDb, err := sql.Open("pgx", connStr)
 	if err != nil {
+		pgContainer.Terminate(ctx)
 		log.Fatalf("Failed to open test database: %v", err)
 	}
 	if err := testDb.Ping(); err != nil {
+		testDb.Close()
+		pgContainer.Terminate(ctx)
 		log.Fatalf("Failed to ping test database: %v", err)
 	}
 	testDb.Close()
@@ -56,6 +59,9 @@ func TestMain(m *testing.M) {
 
 	// Run tests
 	code := m.Run()
+
+	// Terminate container explicitly before os.Exit (which skips defers)
+	pgContainer.Terminate(ctx)
 
 	os.Exit(code)
 }

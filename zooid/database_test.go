@@ -1,7 +1,6 @@
 package zooid
 
 import (
-	"os"
 	"testing"
 )
 
@@ -13,12 +12,16 @@ func TestEnvInt_DefaultValue(t *testing.T) {
 }
 
 func TestEnvInt_FromEnv(t *testing.T) {
-	os.Setenv("TEST_ENV_INT", "100")
-	defer os.Unsetenv("TEST_ENV_INT")
-
-	// Reset env cache so the new value is picked up
-	envOnce.Do(func() {})
+	// Override env cache for this test and restore it afterward.
+	prevVal, hadPrev := env["TEST_ENV_INT"]
 	env["TEST_ENV_INT"] = "100"
+	defer func() {
+		if hadPrev {
+			env["TEST_ENV_INT"] = prevVal
+		} else {
+			delete(env, "TEST_ENV_INT")
+		}
+	}()
 
 	result := envInt("TEST_ENV_INT", 42)
 	if result != 100 {

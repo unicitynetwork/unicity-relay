@@ -204,7 +204,7 @@ LOG_GROUP=$(aws cloudformation describe-stack-resources \
   --query 'StackResources[0].PhysicalResourceId' \
   --output text --region me-central-1)
 
-DATABASE_URL="postgres://zooid:${DB_PASSWORD}@${RDS_ENDPOINT}:5432/zooid?sslmode=require"
+DATABASE_URL="postgres://zooid:${DB_PASSWORD}@${RDS_ENDPOINT}:5432/zooid?sslmode=verify-full"
 ```
 
 ```bash
@@ -341,7 +341,7 @@ In `zooid-relay-cloudformation.yaml`, update the task definition:
 2. Add `DATABASE_URL` env var to `ContainerDefinitions.Environment`:
    ```yaml
    - Name: DATABASE_URL
-     Value: !Sub postgres://zooid:${DBPassword}@${RDSInstance.Endpoint.Address}:5432/zooid?sslmode=require
+     Value: !Sub postgres://zooid:${DBPassword}@${RDSInstance.Endpoint.Address}:5432/zooid?sslmode=verify-full
    ```
 3. Remove `DATA` env var
 4. Remove `MountPoints` block from `ContainerDefinitions`

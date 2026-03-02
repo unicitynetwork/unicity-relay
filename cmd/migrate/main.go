@@ -69,12 +69,12 @@ func main() {
 
 	// Backfill tsvector for events tables
 	if err := backfillSearchVectors(dstDb, tables); err != nil {
-		log.Printf("Warning: failed to backfill search vectors: %v", err)
+		log.Fatalf("Failed to backfill search vectors: %v", err)
 	}
 
 	// Verify row counts
 	if err := verifyCounts(srcDb, dstDb, tables); err != nil {
-		log.Printf("Warning: verification failed: %v", err)
+		log.Fatalf("Verification failed: %v", err)
 	}
 
 	log.Println("Migration completed successfully!")
@@ -103,7 +103,23 @@ func discoverTables(db *sql.DB) ([]string, error) {
 }
 
 func createSchema(db *sql.DB, tables []string) error {
-	for _, table := range tables {
+	// Process __events tables first, then __event_tags (which have FK references to __events).
+	// Sort tables so __events come before __event_tags and other tables.
+	sorted := make([]string, 0, len(tables))
+	var tagTables, otherTables []string
+	for _, t := range tables {
+		if strings.HasSuffix(t, "__events") {
+			sorted = append(sorted, t)
+		} else if strings.HasSuffix(t, "__event_tags") {
+			tagTables = append(tagTables, t)
+		} else {
+			otherTables = append(otherTables, t)
+		}
+	}
+	sorted = append(sorted, tagTables...)
+	sorted = append(sorted, otherTables...)
+
+	for _, table := range sorted {
 		switch {
 		case strings.HasSuffix(table, "__events"):
 			prefix := table[:len(table)-len("__events")]
@@ -263,26 +279,27 @@ func insertBatch(db *sql.DB, table string, cols []string, rows [][]interface{}) 
 	}
 	defer tx.Rollback()
 
-	// Build parameterized INSERT statement
+	// Build parameterized INSERT statement once, then prepare it
 	colList := ""
+	placeholders := ""
 	for i, col := range cols {
 		if i > 0 {
 			colList += ", "
+			placeholders += ", "
 		}
 		colList += col
+		placeholders += fmt.Sprintf("$%d", i+1)
 	}
 
-	for _, row := range rows {
-		placeholders := ""
-		for i := range row {
-			if i > 0 {
-				placeholders += ", "
-			}
-			placeholders += fmt.Sprintf("$%d", i+1)
-		}
+	query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT DO NOTHING", table, colList, placeholders)
+	stmt, err := tx.Prepare(query)
+	if err != nil {
+		return fmt.Errorf("preparing insert for %s: %w", table, err)
+	}
+	defer stmt.Close()
 
-		query := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) ON CONFLICT DO NOTHING", table, colList, placeholders)
-		if _, err := tx.Exec(query, row...); err != nil {
+	for _, row := range rows {
+		if _, err := stmt.Exec(row...); err != nil {
 			return fmt.Errorf("inserting into %s: %w", table, err)
 		}
 	}
@@ -305,6 +322,7 @@ func backfillSearchVectors(db *sql.DB, tables []string) error {
 }
 
 func verifyCounts(srcDb, dstDb *sql.DB, tables []string) error {
+	var mismatches []string
 	for _, table := range tables {
 		var srcCount, dstCount int64
 
@@ -318,8 +336,12 @@ func verifyCounts(srcDb, dstDb *sql.DB, tables []string) error {
 		status := "OK"
 		if srcCount != dstCount {
 			status = "MISMATCH"
+			mismatches = append(mismatches, fmt.Sprintf("%s (source=%d, dest=%d)", table, srcCount, dstCount))
 		}
 		log.Printf("  %s: source=%d dest=%d [%s]", table, srcCount, dstCount, status)
+	}
+	if len(mismatches) > 0 {
+		return fmt.Errorf("row count mismatches: %s", strings.Join(mismatches, ", "))
 	}
 	return nil
 }

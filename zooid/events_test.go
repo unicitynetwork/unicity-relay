@@ -285,6 +285,27 @@ func TestEventStore_QueryEvents_Limit(t *testing.T) {
 	}
 }
 
+func TestEventStore_QueryEvents_MaxLimitCapsUnlimitedFilter(t *testing.T) {
+	store := createTestEventStore()
+	store.Init()
+
+	for i := 0; i < 5; i++ {
+		evt := createTestEvent(nostr.KindTextNote, "maxlimit test")
+		store.SaveEvent(evt)
+	}
+
+	// filter.Limit=0 means "no limit", but maxLimit=2 should cap it
+	filter := nostr.Filter{}
+	events := make([]nostr.Event, 0)
+	for evt := range store.QueryEvents(filter, 2) {
+		events = append(events, evt)
+	}
+
+	if len(events) != 2 {
+		t.Errorf("QueryEvents() with maxLimit=2 and no filter limit returned %d events, want 2", len(events))
+	}
+}
+
 func TestEventStore_QueryEvents_LimitZero(t *testing.T) {
 	store := createTestEventStore()
 	store.Init()
