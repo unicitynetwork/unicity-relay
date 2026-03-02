@@ -3,7 +3,11 @@ package zooid
 import (
 	"database/sql"
 	"log"
+	"strconv"
 	"sync"
+	"time"
+
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 var (
@@ -13,18 +17,35 @@ var (
 
 func GetDb() *sql.DB {
 	dbOnce.Do(func() {
-		newDb, err := sql.Open("sqlite3", Env("DATA")+"/db?_journal_mode=WAL&_sync=NORMAL&_cache_size=1000&_foreign_keys=true")
-
-		if err != nil {
-			log.Fatal("Failed to open database: %w", err)
+		dsn := Env("DATABASE_URL")
+		if dsn == "" {
+			log.Fatal("DATABASE_URL environment variable is required")
 		}
 
-		// SQLite allows only one writer at a time; serializing prevents
-		// WAL lock contention, especially on network filesystems (EFS).
-		newDb.SetMaxOpenConns(1)
+		newDb, err := sql.Open("pgx", dsn)
+		if err != nil {
+			log.Fatalf("Failed to open database: %v", err)
+		}
+
+		maxOpen := envInt("DB_MAX_OPEN_CONNS", 20)
+		maxIdle := envInt("DB_MAX_IDLE_CONNS", 5)
+		connMaxLife := envInt("DB_CONN_MAX_LIFETIME_SECS", 300)
+
+		newDb.SetMaxOpenConns(maxOpen)
+		newDb.SetMaxIdleConns(maxIdle)
+		newDb.SetConnMaxLifetime(time.Duration(connMaxLife) * time.Second)
 
 		db = newDb
 	})
 
 	return db
+}
+
+func envInt(key string, fallback int) int {
+	if v := Env(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return fallback
 }
