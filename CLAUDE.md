@@ -10,7 +10,7 @@ Zooid is a multi-tenant Nostr relay built on [Khatru](https://gitworkshop.dev/fi
 
 ```bash
 just run         # Run the relay (go run cmd/relay/main.go)
-just build       # Build binary to bin/zooid (requires CGO_ENABLED=1)
+just build       # Build binary to bin/zooid
 just test        # Run all unit tests (go test -v ./...)
 just fmt         # Format code (gofmt -w -s .)
 
@@ -31,14 +31,14 @@ The entrypoint is `cmd/relay/main.go`. A single HTTP server dispatches requests 
 
 Each `Instance` composes these stores:
 - **Config** — parsed TOML config, holds relay secret key, role definitions
-- **EventStore** — SQLite storage with schema-prefixed tables (e.g., `myrelay__events`), uses Squirrel query builder
+- **EventStore** — PostgreSQL storage with schema-prefixed tables (e.g., `myrelay__events`), uses Squirrel query builder
 - **GroupStore** — NIP-29 group management (create, delete, membership, visibility, invite codes)
 - **ManagementStore** — NIP-86 relay management (ban/allow pubkeys/events, membership lists)
 - **BlossomStore** — media file upload/download (stored on filesystem in `./media/`)
 
 ### Database
 
-Single shared SQLite database at `./data/db` with WAL mode. Each virtual relay gets its own table namespace via `Schema.Prefix()` (e.g., `schemaname__events`, `schemaname__event_tags`). FTS5 is used for full-text search when available.
+Single shared PostgreSQL database configured via `DATABASE_URL` environment variable. Each virtual relay gets its own table namespace via `Schema.Prefix()` (e.g., `schemaname__events`, `schemaname__event_tags`). PostgreSQL tsvector is used for full-text search. Connection pool is configurable via `DB_MAX_OPEN_CONNS`, `DB_MAX_IDLE_CONNS`, `DB_CONN_MAX_LIFETIME_SECS`.
 
 ### Hot Reloading
 
@@ -57,7 +57,7 @@ Groups have three independent flags set via metadata tags: `private` (content re
 
 ### Environment Variables
 
-`PORT` (default 3334), `CONFIG` (default ./config), `MEDIA` (default ./media), `DATA` (default ./data). See `env.go`.
+`DATABASE_URL` (required, PostgreSQL connection string), `PORT` (default 3334), `CONFIG` (default ./config), `MEDIA` (default ./media). See `env.go` and `database.go`.
 
 ### Config Policy Options
 

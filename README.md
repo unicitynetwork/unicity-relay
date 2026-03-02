@@ -45,19 +45,22 @@ A single zooid instance can run any number of "virtual" relays. The `config` dir
 
 ## Environment
 
-Zooid supports a few environment variables, which configure shared resources like the web server or sqlite database.
+Zooid supports a few environment variables, which configure shared resources like the web server or PostgreSQL database.
 
+- `DATABASE_URL` - **required**. PostgreSQL connection string (e.g., `postgres://user:pass@host:5432/dbname?sslmode=verify-full`).
 - `PORT` - the port the server will listen on for all requests. Defaults to `3334`.
 - `CONFIG` - where to store relay configuration files. Defaults to `./config`.
 - `MEDIA` - where to store blossom media files. Defaults to `./media`.
-- `DATA` - where to store databse files. Defaults to `./data`.
+- `DB_MAX_OPEN_CONNS` - maximum open database connections. Defaults to `20`.
+- `DB_MAX_IDLE_CONNS` - maximum idle database connections. Defaults to `5`.
+- `DB_CONN_MAX_LIFETIME_SECS` - connection max lifetime in seconds. Defaults to `300`.
 
 ## Configuration
 
 Configuration files are written using [toml](https://toml.io). Top level configuration options are required:
 
 - `host` - a hostname to serve this relay on.
-- `schema` - a string that identifies this relay. This cannot be changed, and must be usable as a sqlite identifier.
+- `schema` - a string that identifies this relay. This cannot be changed, and must be usable as a SQL identifier (alphanumeric and underscores only).
 - `secret` - the nostr secret key of the relay. Will be used to populate the relay's NIP 11 `self` field and sign generated events.
 
 ### `[info]`
@@ -153,20 +156,30 @@ See `justfile` for defined commands.
 
 ## Deploying
 
-Zooid can be run using an OCI container:
+Zooid requires a PostgreSQL 16+ database. It can be run using an OCI container:
 
 ```sh
 podman run -it \
   -p 3334:3334 \
+  -e DATABASE_URL="postgres://zooid:password@db-host:5432/zooid?sslmode=verify-full" \
   -v ./config:/app/config \
   -v ./media:/app/media \
-  -v ./data:/app/data \
   ghcr.io/coracle-social/zooid
 ```
 
 ## Running with Unicity Sphere
 
-For local development with Sphere, use Docker Compose:
+For local development with Sphere, start the PostgreSQL database and the relay:
+
+```bash
+# Start PostgreSQL
+docker compose up -d postgres
+
+# Run the relay (requires DATABASE_URL)
+DATABASE_URL="postgres://zooid:dev@localhost:5432/zooid?sslmode=disable" just run
+```
+
+Or use Docker Compose with a full containerized setup:
 
 ```bash
 cd /path/to/groupchat  # Contains docker-compose.yml and config/
@@ -255,6 +268,7 @@ When running in AWS ECS, these environment variables configure the relay:
 
 | Variable | Description |
 |----------|-------------|
+| `DATABASE_URL` | **Required.** PostgreSQL connection string (e.g., `postgres://user:pass@host:5432/zooid?sslmode=verify-full`) |
 | `RELAY_HOST` | Domain name (e.g., `sphere-relay.unicity.network`) |
 | `RELAY_SECRET` | Nostr private key (64-char hex) |
 | `RELAY_NAME` | Display name |
@@ -263,3 +277,6 @@ When running in AWS ECS, these environment variables configure the relay:
 | `GROUPS_ADMIN_CREATE_ONLY` | Only admins can create groups (default: `true`) |
 | `GROUPS_PRIVATE_ADMIN_ONLY` | Only admins can create private groups (default: `true`) |
 | `GROUPS_PRIVATE_RELAY_ADMIN_ACCESS` | Relay admins can see/moderate private groups (default: `false`) |
+| `DB_MAX_OPEN_CONNS` | Max open DB connections (default: `20`) |
+| `DB_MAX_IDLE_CONNS` | Max idle DB connections (default: `5`) |
+| `DB_CONN_MAX_LIFETIME_SECS` | Connection max lifetime in seconds (default: `300`) |
