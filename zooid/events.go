@@ -153,6 +153,10 @@ func (events *EventStore) QueryEvents(filter nostr.Filter, maxLimit int) iter.Se
 				return
 			}
 		}
+
+		if err := rows.Err(); err != nil {
+			log.Printf("QueryEvents row iteration error: %v", err)
+		}
 	}
 }
 
@@ -244,6 +248,12 @@ func (events *EventStore) SaveEvent(evt nostr.Event) error {
 		return fmt.Errorf("failed to marshal tags: %w", err)
 	}
 
+	tx, err := GetDb().Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
 	// Insert the event, using ON CONFLICT to atomically detect duplicates.
 	// This is race-safe with PostgreSQL's concurrent connections (unlike SELECT-then-INSERT).
 	insertQb := sb.Insert(events.Schema.Prefix("events")).
@@ -259,7 +269,7 @@ func (events *EventStore) SaveEvent(evt nostr.Event) error {
 		).
 		Suffix("ON CONFLICT(id) DO NOTHING")
 
-	result, err := insertQb.RunWith(GetDb()).Exec()
+	result, err := insertQb.RunWith(tx).Exec()
 	if err != nil {
 		return fmt.Errorf("failed to save event '%s': %w", evt.ID, err)
 	}
@@ -282,10 +292,12 @@ func (events *EventStore) SaveEvent(evt nostr.Event) error {
 	}
 
 	if hasTags {
-		_, _ = tagQb.RunWith(GetDb()).Exec()
+		if _, err := tagQb.RunWith(tx).Exec(); err != nil {
+			return fmt.Errorf("failed to save tags for event '%s': %w", evt.ID, err)
+		}
 	}
 
-	return nil
+	return tx.Commit()
 }
 
 func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
@@ -319,10 +331,10 @@ func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
 }
 
 func (events *EventStore) CountEvents(filter nostr.Filter) (uint32, error) {
-	// Build a count query based on the select query but with COUNT(*) instead
+	// Strip limit so we get the true total count matching the filter
+	filter.Limit = 0
 	qb := events.buildSelectQuery(filter)
 
-	// Convert the select query to a count query
 	countQb := sb.Select("COUNT(*)").FromSelect(qb, "subquery")
 
 	var count uint32

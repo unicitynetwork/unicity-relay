@@ -5,10 +5,14 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"regexp"
+	"strings"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/mattn/go-sqlite3"
 )
+
+var safeTableName = regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
@@ -89,6 +93,10 @@ func discoverTables(db *sql.DB) ([]string, error) {
 		if err := rows.Scan(&name); err != nil {
 			return nil, err
 		}
+		if !safeTableName.MatchString(name) {
+			log.Printf("Skipping table with unsafe name: %q", name)
+			continue
+		}
 		tables = append(tables, name)
 	}
 	return tables, nil
@@ -97,7 +105,7 @@ func discoverTables(db *sql.DB) ([]string, error) {
 func createSchema(db *sql.DB, tables []string) error {
 	for _, table := range tables {
 		switch {
-		case endsWith(table, "__events"):
+		case strings.HasSuffix(table, "__events"):
 			prefix := table[:len(table)-len("__events")]
 			stmts := []string{
 				fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
@@ -135,7 +143,7 @@ func createSchema(db *sql.DB, tables []string) error {
 			}
 			continue
 
-		case endsWith(table, "__event_tags"):
+		case strings.HasSuffix(table, "__event_tags"):
 			prefix := table[:len(table)-len("__event_tags")]
 			eventsTable := prefix + "__events"
 			stmts := []string{
@@ -162,7 +170,6 @@ func createSchema(db *sql.DB, tables []string) error {
 					key TEXT PRIMARY KEY,
 					value TEXT NOT NULL
 				)`,
-				`CREATE INDEX IF NOT EXISTS idx_kv_key ON kv(key)`,
 			}
 			for _, s := range stmts {
 				if _, err := db.Exec(s); err != nil {
@@ -285,7 +292,7 @@ func insertBatch(db *sql.DB, table string, cols []string, rows [][]interface{}) 
 
 func backfillSearchVectors(db *sql.DB, tables []string) error {
 	for _, table := range tables {
-		if endsWith(table, "__events") {
+		if strings.HasSuffix(table, "__events") {
 			log.Printf("Backfilling search vectors for %s...", table)
 			// Trigger fires on UPDATE, so update content to itself
 			_, err := db.Exec(fmt.Sprintf("UPDATE %s SET content = content", table))
@@ -315,8 +322,4 @@ func verifyCounts(srcDb, dstDb *sql.DB, tables []string) error {
 		log.Printf("  %s: source=%d dest=%d [%s]", table, srcCount, dstCount, status)
 	}
 	return nil
-}
-
-func endsWith(s, suffix string) bool {
-	return len(s) >= len(suffix) && s[len(s)-len(suffix):] == suffix
 }

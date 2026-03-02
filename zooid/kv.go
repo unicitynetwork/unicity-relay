@@ -28,7 +28,6 @@ func (kv *KeyValueStore) Migrate() {
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL
 		)`,
-		`CREATE INDEX IF NOT EXISTS idx_kv_key ON kv(key)`,
 	}
 
 	for _, stmt := range statements {

@@ -3,6 +3,7 @@ package zooid
 import (
 	"database/sql"
 	"log"
+	"strconv"
 	"sync"
 	"time"
 
@@ -26,13 +27,25 @@ func GetDb() *sql.DB {
 			log.Fatalf("Failed to open database: %v", err)
 		}
 
-		// Single ECS task — generous pool for concurrent WebSocket handlers
-		newDb.SetMaxOpenConns(20)
-		newDb.SetMaxIdleConns(5)
-		newDb.SetConnMaxLifetime(5 * time.Minute)
+		maxOpen := envInt("DB_MAX_OPEN_CONNS", 20)
+		maxIdle := envInt("DB_MAX_IDLE_CONNS", 5)
+		connMaxLife := envInt("DB_CONN_MAX_LIFETIME_SECS", 300)
+
+		newDb.SetMaxOpenConns(maxOpen)
+		newDb.SetMaxIdleConns(maxIdle)
+		newDb.SetConnMaxLifetime(time.Duration(connMaxLife) * time.Second)
 
 		db = newDb
 	})
 
 	return db
+}
+
+func envInt(key string, fallback int) int {
+	if v := Env(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return fallback
 }
