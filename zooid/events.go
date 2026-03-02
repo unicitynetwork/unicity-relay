@@ -1,6 +1,8 @@
 package zooid
 
 import (
+	"context"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -96,6 +98,10 @@ func (events *EventStore) Close() {
 }
 
 func (events *EventStore) QueryEvents(filter nostr.Filter, maxLimit int) iter.Seq[nostr.Event] {
+	return events.queryEventsWith(GetDb(), filter, maxLimit)
+}
+
+func (events *EventStore) queryEventsWith(runner squirrel.BaseRunner, filter nostr.Filter, maxLimit int) iter.Seq[nostr.Event] {
 	return func(yield func(nostr.Event) bool) {
 		if filter.LimitZero {
 			return
@@ -105,7 +111,7 @@ func (events *EventStore) QueryEvents(filter nostr.Filter, maxLimit int) iter.Se
 			filter.Limit = maxLimit
 		}
 
-		rows, err := events.buildSelectQuery(filter).RunWith(GetDb()).Query()
+		rows, err := events.buildSelectQuery(filter).RunWith(runner).Query()
 		if err != nil {
 			log.Printf("QueryEvents query error: %v", err)
 			return
@@ -240,23 +246,35 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectB
 }
 
 func (events *EventStore) DeleteEvent(id nostr.ID) error {
-	_, err := sb.Delete(events.Schema.Prefix("events")).Where(squirrel.Eq{"id": id.Hex()}).RunWith(GetDb()).Exec()
+	return events.deleteEventWith(GetDb(), id)
+}
 
+func (events *EventStore) deleteEventWith(runner squirrel.BaseRunner, id nostr.ID) error {
+	_, err := sb.Delete(events.Schema.Prefix("events")).Where(squirrel.Eq{"id": id.Hex()}).RunWith(runner).Exec()
 	return err
 }
 
 func (events *EventStore) SaveEvent(evt nostr.Event) error {
-	// Serialize tags to JSON
-	tagsJSON, err := json.Marshal(evt.Tags)
-	if err != nil {
-		return fmt.Errorf("failed to marshal tags: %w", err)
-	}
-
 	tx, err := GetDb().Begin()
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
+
+	if err := events.saveEventWith(tx, evt); err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// saveEventWith inserts an event and its tags using the provided runner.
+// The caller is responsible for transaction management.
+func (events *EventStore) saveEventWith(runner squirrel.BaseRunner, evt nostr.Event) error {
+	tagsJSON, err := json.Marshal(evt.Tags)
+	if err != nil {
+		return fmt.Errorf("failed to marshal tags: %w", err)
+	}
 
 	// Insert the event, using ON CONFLICT to atomically detect duplicates.
 	// This is race-safe with PostgreSQL's concurrent connections (unlike SELECT-then-INSERT).
@@ -273,7 +291,7 @@ func (events *EventStore) SaveEvent(evt nostr.Event) error {
 		).
 		Suffix("ON CONFLICT(id) DO NOTHING")
 
-	result, err := insertQb.RunWith(tx).Exec()
+	result, err := insertQb.RunWith(runner).Exec()
 	if err != nil {
 		return fmt.Errorf("failed to save event '%s': %w", evt.ID, err)
 	}
@@ -296,15 +314,28 @@ func (events *EventStore) SaveEvent(evt nostr.Event) error {
 	}
 
 	if hasTags {
-		if _, err := tagQb.RunWith(tx).Exec(); err != nil {
+		if _, err := tagQb.RunWith(runner).Exec(); err != nil {
 			return fmt.Errorf("failed to save tags for event '%s': %w", evt.ID, err)
 		}
 	}
 
-	return tx.Commit()
+	return nil
 }
 
 func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
+	// Use a serializable transaction so the read-decide-write-delete cycle is
+	// atomic. Without this, two concurrent goroutines could both read "no
+	// existing event", both insert, and leave duplicate replaceable events.
+	// PostgreSQL may return a serialization error under contention; in that
+	// case the client can simply retry the publish.
+	tx, err := GetDb().BeginTx(context.Background(), &sql.TxOptions{
+		Isolation: sql.LevelSerializable,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
 	filter := nostr.Filter{Kinds: []nostr.Kind{evt.Kind}, Authors: []nostr.PubKey{evt.PubKey}}
 	if evt.Kind.IsAddressable() {
 		filter.Tags = nostr.TagMap{"d": []string{evt.Tags.GetD()}}
@@ -312,7 +343,7 @@ func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
 
 	shouldSave := true
 	shouldDelete := make([]nostr.ID, 0)
-	for previous := range events.QueryEvents(filter, 1) {
+	for previous := range events.queryEventsWith(tx, filter, 0) {
 		if previous.CreatedAt <= evt.CreatedAt {
 			shouldDelete = append(shouldDelete, previous.ID)
 		} else {
@@ -321,17 +352,18 @@ func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
 	}
 
 	if shouldSave {
-		if err := events.SaveEvent(evt); err != nil && err != eventstore.ErrDupEvent {
+		if err := events.saveEventWith(tx, evt); err != nil && err != eventstore.ErrDupEvent {
 			return fmt.Errorf("failed to save: %w", err)
 		}
 	}
 
-	// Wait until the end to delete old events, just in case our new one doesn't save
 	for _, id := range shouldDelete {
-		events.DeleteEvent(id)
+		if err := events.deleteEventWith(tx, id); err != nil {
+			return fmt.Errorf("failed to delete old event: %w", err)
+		}
 	}
 
-	return nil
+	return tx.Commit()
 }
 
 func (events *EventStore) CountEvents(filter nostr.Filter) (uint32, error) {
