@@ -5,11 +5,14 @@ import (
 	"iter"
 	"log"
 	"net/http"
+	"reflect"
 	"slices"
 	"strings"
+	"unsafe"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/khatru"
+	"github.com/fasthttp/websocket"
 	"github.com/gosimple/slug"
 )
 
@@ -29,6 +32,13 @@ func MakeInstance(filename string) (*Instance, error) {
 	}
 
 	relay := khatru.NewRelay()
+
+	// Enable WebSocket per-message compression (permessage-deflate).
+	// The upgrader field is unexported, so we use reflect/unsafe to set it.
+	rv := reflect.ValueOf(relay).Elem()
+	field := rv.FieldByName("upgrader")
+	upgrader := (*websocket.Upgrader)(unsafe.Pointer(field.UnsafeAddr()))
+	upgrader.EnableCompression = true
 
 	events := &EventStore{
 		Relay:  relay,
@@ -225,6 +235,13 @@ func (instance *Instance) IsWriteOnlyEvent(event nostr.Event) bool {
 	return slices.Contains(writeOnlyEventKinds, event.Kind)
 }
 
+// isLargeListEvent returns true for events that are too large to broadcast
+// to all subscribers (e.g. group members list with thousands of entries).
+// These events are still stored and served on explicit REQ.
+func isLargeListEvent(event nostr.Event) bool {
+	return event.Kind == nostr.KindSimpleGroupMembers
+}
+
 func (instance *Instance) GenerateInviteEvent(pubkey nostr.PubKey) nostr.Event {
 	filter := nostr.Filter{
 		Kinds: []nostr.Kind{RELAY_INVITE},
@@ -260,7 +277,7 @@ func (instance *Instance) OnConnect(ctx context.Context) {
 }
 
 func (instance *Instance) PreventBroadcast(ws *khatru.WebSocket, filter nostr.Filter, event nostr.Event) bool {
-	return instance.IsWriteOnlyEvent(event)
+	return instance.IsWriteOnlyEvent(event) || isLargeListEvent(event)
 }
 
 func (instance *Instance) StoreEvent(ctx context.Context, event nostr.Event) error {
