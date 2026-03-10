@@ -469,6 +469,367 @@ func TestGroupMembershipCache_Creator(t *testing.T) {
 	}
 }
 
+// === Write-restricted and role cache tests ===
+
+func TestGroupMetadataCache_WriteRestricted(t *testing.T) {
+	groups, _ := createTestGroupStore()
+	groups.WarmCaches()
+
+	// Create a write-restricted group
+	createEvent := nostr.Event{
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"h", "announcements"},
+		},
+		Content: `{"name":"Announcements","closed":true,"write-restricted":true}`,
+	}
+	groups.UpdateMetadata(createEvent)
+
+	if !groups.IsWriteRestricted("announcements") {
+		t.Error("IsWriteRestricted should return true for write-restricted group")
+	}
+
+	// Create a normal group
+	normalEvent := nostr.Event{
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"h", "general"},
+		},
+		Content: `{"name":"General"}`,
+	}
+	groups.UpdateMetadata(normalEvent)
+
+	if groups.IsWriteRestricted("general") {
+		t.Error("IsWriteRestricted should return false for normal group")
+	}
+}
+
+func TestGroupMetadataCache_WriteRestrictedWarmUp(t *testing.T) {
+	groups, _ := createTestGroupStore()
+
+	// Store a write-restricted group
+	createEvent := nostr.Event{
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"h", "wrgrp"},
+		},
+		Content: `{"name":"WR Group","write-restricted":true}`,
+	}
+	groups.UpdateMetadata(createEvent)
+
+	// Fresh store and warm
+	groups2 := &GroupStore{
+		Config:     groups.Config,
+		Events:     groups.Events,
+		Management: groups.Management,
+	}
+	groups2.WarmCaches()
+
+	if !groups2.IsWriteRestricted("wrgrp") {
+		t.Error("IsWriteRestricted should return true after WarmCaches")
+	}
+}
+
+func TestRoleCache_SetAndCheck(t *testing.T) {
+	groups, _ := createTestGroupStore()
+	groups.WarmCaches()
+
+	pk := nostr.Generate().Public()
+
+	// No roles initially
+	if groups.HasRole("grp", pk, "writer") {
+		t.Error("HasRole should return false before setting roles")
+	}
+
+	// Set writer role
+	groups.SetMemberRoles("grp", pk, []string{"writer"})
+
+	if !groups.HasRole("grp", pk, "writer") {
+		t.Error("HasRole should return true after SetMemberRoles")
+	}
+
+	// Replace roles (remove writer)
+	groups.SetMemberRoles("grp", pk, []string{})
+
+	if groups.HasRole("grp", pk, "writer") {
+		t.Error("HasRole should return false after roles replaced with empty set")
+	}
+}
+
+func TestRoleCache_ClearOnRemove(t *testing.T) {
+	groups, _ := createTestGroupStore()
+	groups.WarmCaches()
+
+	pk := nostr.Generate().Public()
+
+	groups.SetMemberRoles("grp", pk, []string{"writer"})
+	if !groups.HasRole("grp", pk, "writer") {
+		t.Fatal("HasRole should return true after SetMemberRoles")
+	}
+
+	groups.ClearMemberRoles("grp", pk)
+
+	if groups.HasRole("grp", pk, "writer") {
+		t.Error("HasRole should return false after ClearMemberRoles")
+	}
+}
+
+func TestRoleCache_WarmUpFromPutUserEvents(t *testing.T) {
+	groups, _ := createTestGroupStore()
+
+	pk := nostr.Generate().Public()
+
+	// Store a put-user event with writer role (p tag has role at position 2+)
+	putEvent := nostr.Event{
+		Kind:      nostr.KindSimpleGroupPutUser,
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"p", pk.Hex(), "writer"},
+			{"h", "rolegrp"},
+		},
+	}
+	groups.Events.SignAndStoreEvent(&putEvent, false)
+
+	// Fresh store and warm
+	groups2 := &GroupStore{
+		Config:     groups.Config,
+		Events:     groups.Events,
+		Management: groups.Management,
+	}
+	groups2.WarmCaches()
+
+	if !groups2.HasRole("rolegrp", pk, "writer") {
+		t.Error("HasRole should return true after WarmCaches with put-user role")
+	}
+	if !groups2.IsMember("rolegrp", pk) {
+		t.Error("IsMember should also return true")
+	}
+}
+
+func TestRoleCache_WarmUpRoleReplacement(t *testing.T) {
+	groups, _ := createTestGroupStore()
+
+	pk := nostr.Generate().Public()
+
+	// First put-user with writer role
+	putEvent1 := nostr.Event{
+		Kind:      nostr.KindSimpleGroupPutUser,
+		CreatedAt: nostr.Timestamp(1000),
+		Tags: nostr.Tags{
+			{"p", pk.Hex(), "writer"},
+			{"h", "replacegrp"},
+		},
+	}
+	groups.Events.SignAndStoreEvent(&putEvent1, false)
+
+	// Second put-user without writer role (should replace)
+	putEvent2 := nostr.Event{
+		Kind:      nostr.KindSimpleGroupPutUser,
+		CreatedAt: nostr.Timestamp(2000),
+		Tags: nostr.Tags{
+			{"p", pk.Hex()},
+			{"h", "replacegrp"},
+		},
+	}
+	groups.Events.SignAndStoreEvent(&putEvent2, false)
+
+	// Fresh store and warm
+	groups2 := &GroupStore{
+		Config:     groups.Config,
+		Events:     groups.Events,
+		Management: groups.Management,
+	}
+	groups2.WarmCaches()
+
+	if groups2.HasRole("replacegrp", pk, "writer") {
+		t.Error("HasRole should return false after role was replaced by later put-user")
+	}
+	if !groups2.IsMember("replacegrp", pk) {
+		t.Error("IsMember should still return true")
+	}
+}
+
+func TestCanWrite_NotWriteRestricted(t *testing.T) {
+	groups, _ := createTestGroupStore()
+	groups.WarmCaches()
+
+	// Create normal group
+	createEvent := nostr.Event{
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "normalgrp"}},
+		Content:   `{"name":"Normal"}`,
+	}
+	groups.UpdateMetadata(createEvent)
+
+	pk := nostr.Generate().Public()
+	if !groups.CanWrite("normalgrp", pk) {
+		t.Error("CanWrite should return true for non-write-restricted groups")
+	}
+}
+
+func TestCanWrite_WriteRestricted_NoRole(t *testing.T) {
+	groups, _ := createTestGroupStore()
+	groups.Config.Info.Pubkey = nostr.Generate().Public().Hex()
+	groups.WarmCaches()
+
+	// Create write-restricted group
+	createEvent := nostr.Event{
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wrgrp"}},
+		Content:   `{"name":"WR","write-restricted":true}`,
+	}
+	groups.UpdateMetadata(createEvent)
+
+	pk := nostr.Generate().Public()
+	groups.AddMember("wrgrp", pk)
+
+	if groups.CanWrite("wrgrp", pk) {
+		t.Error("CanWrite should return false for member without writer role")
+	}
+}
+
+func TestCanWrite_WriteRestricted_WithWriterRole(t *testing.T) {
+	groups, _ := createTestGroupStore()
+	groups.Config.Info.Pubkey = nostr.Generate().Public().Hex()
+	groups.WarmCaches()
+
+	createEvent := nostr.Event{
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wrgrp"}},
+		Content:   `{"name":"WR","write-restricted":true}`,
+	}
+	groups.UpdateMetadata(createEvent)
+
+	pk := nostr.Generate().Public()
+	groups.AddMember("wrgrp", pk)
+	groups.SetMemberRoles("wrgrp", pk, []string{"writer"})
+
+	if !groups.CanWrite("wrgrp", pk) {
+		t.Error("CanWrite should return true for member with writer role")
+	}
+}
+
+func TestCanWrite_WriteRestricted_Admin(t *testing.T) {
+	groups, _ := createTestGroupStore()
+	owner := nostr.Generate().Public()
+	groups.Config.Info.Pubkey = owner.Hex()
+	groups.WarmCaches()
+
+	createEvent := nostr.Event{
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wrgrp"}},
+		Content:   `{"name":"WR","write-restricted":true}`,
+	}
+	groups.UpdateMetadata(createEvent)
+
+	if !groups.CanWrite("wrgrp", owner) {
+		t.Error("CanWrite should return true for admin/owner")
+	}
+}
+
+func TestCanWrite_WriteRestricted_Creator(t *testing.T) {
+	groups, _ := createTestGroupStore()
+	groups.Config.Info.Pubkey = nostr.Generate().Public().Hex()
+	groups.WarmCaches()
+
+	creator := nostr.Generate().Public()
+
+	// Set the creator
+	groups.creatorCache.Store("wrgrp", creator)
+
+	createEvent := nostr.Event{
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wrgrp"}},
+		Content:   `{"name":"WR","write-restricted":true}`,
+	}
+	groups.UpdateMetadata(createEvent)
+
+	if !groups.CanWrite("wrgrp", creator) {
+		t.Error("CanWrite should return true for group creator")
+	}
+}
+
+func TestCheckWrite_WriteRestrictedCreation_AdminAllowed(t *testing.T) {
+	groups, _ := createTestGroupStore()
+	admin := nostr.Generate().Public()
+	groups.Config.Info.Pubkey = admin.Hex()
+	groups.WarmCaches()
+
+	event := nostr.Event{
+		Kind:      nostr.KindSimpleGroupCreateGroup,
+		CreatedAt: nostr.Now(),
+		PubKey:    admin,
+		Tags:      nostr.Tags{{"h", "announcements"}},
+		Content:   `{"name":"Announcements","closed":true,"write-restricted":true}`,
+	}
+
+	result := groups.CheckWrite(event)
+	if result != "" {
+		t.Errorf("CheckWrite should allow admin to create write-restricted group, got: %s", result)
+	}
+}
+
+func TestCheckWrite_WriteRestrictedCreation_NonAdminRejected(t *testing.T) {
+	groups, _ := createTestGroupStore()
+	groups.Config.Info.Pubkey = nostr.Generate().Public().Hex()
+	groups.WarmCaches()
+
+	nonAdmin := nostr.Generate().Public()
+	event := nostr.Event{
+		Kind:      nostr.KindSimpleGroupCreateGroup,
+		CreatedAt: nostr.Now(),
+		PubKey:    nonAdmin,
+		Tags:      nostr.Tags{{"h", "announcements"}},
+		Content:   `{"name":"Announcements","closed":true,"write-restricted":true}`,
+	}
+
+	result := groups.CheckWrite(event)
+	if result == "" {
+		t.Error("CheckWrite should reject non-admin creating write-restricted group")
+	}
+	if result != "restricted: only admins can create write-restricted groups" {
+		t.Errorf("unexpected error message: %s", result)
+	}
+}
+
+func TestCheckWrite_NormalCreation_NonAdminAllowed(t *testing.T) {
+	groups, _ := createTestGroupStore()
+	groups.Config.Info.Pubkey = nostr.Generate().Public().Hex()
+	groups.WarmCaches()
+
+	nonAdmin := nostr.Generate().Public()
+	event := nostr.Event{
+		Kind:      nostr.KindSimpleGroupCreateGroup,
+		CreatedAt: nostr.Now(),
+		PubKey:    nonAdmin,
+		Tags:      nostr.Tags{{"h", "general"}},
+		Content:   `{"name":"General"}`,
+	}
+
+	result := groups.CheckWrite(event)
+	if result != "" {
+		t.Errorf("CheckWrite should allow non-admin to create normal group, got: %s", result)
+	}
+}
+
+func TestGroupDeleteClearsRoleCache(t *testing.T) {
+	groups, _ := createTestGroupStore()
+	groups.WarmCaches()
+
+	pk := nostr.Generate().Public()
+	groups.SetMemberRoles("delgrp", pk, []string{"writer"})
+
+	if !groups.HasRole("delgrp", pk, "writer") {
+		t.Fatal("HasRole should return true before delete")
+	}
+
+	groups.DeleteGroup("delgrp")
+
+	if groups.HasRole("delgrp", pk, "writer") {
+		t.Error("HasRole should return false after DeleteGroup")
+	}
+}
+
 func TestGroupMembershipCache_DeleteClearsAll(t *testing.T) {
 	groups, _ := createTestGroupStore()
 	groups.WarmCaches()

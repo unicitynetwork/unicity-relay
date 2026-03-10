@@ -84,6 +84,29 @@ func TestGetInviteCodeFromEvent(t *testing.T) {
 	}
 }
 
+func TestIsWriteRestrictedGroupContentFunc(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"write-restricted true", `{"name":"Test","write-restricted":true}`, true},
+		{"write-restricted false", `{"name":"Test","write-restricted":false}`, false},
+		{"no field", `{"name":"Test"}`, false},
+		{"empty", "", false},
+		{"invalid JSON", "not json", false},
+		{"string type", `{"write-restricted":"true"}`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isWriteRestrictedGroupContent(tt.content)
+			if result != tt.want {
+				t.Errorf("isWriteRestrictedGroupContent(%q) = %v, want %v", tt.content, result, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsPrivateGroupContent(t *testing.T) {
 	tests := []struct {
 		name    string
