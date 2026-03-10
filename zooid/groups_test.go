@@ -1,7 +1,6 @@
 package zooid
 
 import (
-	"encoding/json"
 	"testing"
 
 	"fiatjaf.com/nostr"
@@ -103,47 +102,6 @@ func TestIsWriteRestrictedGroupContentFunc(t *testing.T) {
 			result := isWriteRestrictedGroupContent(tt.content)
 			if result != tt.want {
 				t.Errorf("isWriteRestrictedGroupContent(%q) = %v, want %v", tt.content, result, tt.want)
-			}
-		})
-	}
-}
-
-func TestIsWriteRestrictedGroupContent(t *testing.T) {
-	tests := []struct {
-		name    string
-		content string
-		want    bool
-	}{
-		{
-			name:    "write-restricted true",
-			content: `{"name": "Announcements", "write-restricted": true}`,
-			want:    true,
-		},
-		{
-			name:    "write-restricted false",
-			content: `{"name": "Test", "write-restricted": false}`,
-			want:    false,
-		},
-		{
-			name:    "no write-restricted field",
-			content: `{"name": "Test"}`,
-			want:    false,
-		},
-		{
-			name:    "write-restricted with closed",
-			content: `{"name": "Announcements", "closed": true, "write-restricted": true}`,
-			want:    true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var data map[string]interface{}
-			json.Unmarshal([]byte(tt.content), &data)
-			wr, ok := data["write-restricted"].(bool)
-			result := ok && wr
-			if result != tt.want {
-				t.Errorf("write-restricted check for %q = %v, want %v", tt.content, result, tt.want)
 			}
 		})
 	}

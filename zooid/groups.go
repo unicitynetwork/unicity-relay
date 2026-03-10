@@ -360,6 +360,9 @@ func (g *GroupStore) AddMember(h string, pubkey nostr.PubKey) error {
 	ms.members[pubkey] = struct{}{}
 	ms.mu.Unlock()
 
+	// AddMember adds without roles, so clear any existing roles
+	g.ClearMemberRoles(h, pubkey)
+
 	return nil
 }
 
@@ -383,6 +386,8 @@ func (g *GroupStore) RemoveMember(h string, pubkey nostr.PubKey) error {
 		delete(ms.members, pubkey)
 		ms.mu.Unlock()
 	}
+
+	g.ClearMemberRoles(h, pubkey)
 
 	return nil
 }
@@ -465,18 +470,24 @@ func (g *GroupStore) UpdateMembersList(h string) error {
 		nostr.Tag{"d", h},
 	}
 
+	// Snapshot role data once to avoid repeated sync.Map lookups and lock churn
+	var roleSnapshot map[nostr.PubKey]map[string]struct{}
+	if v, ok := g.roleCache.Load(h); ok {
+		rs := v.(*roleSet)
+		rs.mu.RLock()
+		roleSnapshot = make(map[nostr.PubKey]map[string]struct{}, len(rs.roles))
+		for pk, roles := range rs.roles {
+			roleSnapshot[pk] = roles
+		}
+		rs.mu.RUnlock()
+	}
+
 	for _, pubkey := range g.GetMembers(h) {
 		pTag := nostr.Tag{"p", pubkey.Hex()}
-		// Append roles if any exist in the role cache
-		if v, ok := g.roleCache.Load(h); ok {
-			rs := v.(*roleSet)
-			rs.mu.RLock()
-			if roles, exists := rs.roles[pubkey]; exists {
-				for role := range roles {
-					pTag = append(pTag, role)
-				}
+		if roles, exists := roleSnapshot[pubkey]; exists {
+			for role := range roles {
+				pTag = append(pTag, role)
 			}
-			rs.mu.RUnlock()
 		}
 		tags = append(tags, pTag)
 	}
@@ -595,7 +606,7 @@ func (g *GroupStore) HasRole(h string, pubkey nostr.PubKey, role string) bool {
 
 // CanWrite checks if a user can post content to a write-restricted group.
 // Returns true if the group is not write-restricted, or if the user is an
-// admin, group creator, or has the "writer" role.
+// admin, group creator, or has the "writer" role AND is a current member.
 func (g *GroupStore) CanWrite(h string, pubkey nostr.PubKey) bool {
 	if !g.IsWriteRestricted(h) {
 		return true
@@ -603,7 +614,7 @@ func (g *GroupStore) CanWrite(h string, pubkey nostr.PubKey) bool {
 	if g.Config.CanManage(pubkey) || g.IsGroupCreator(h, pubkey) {
 		return true
 	}
-	return g.HasRole(h, pubkey, "writer")
+	return g.IsMember(h, pubkey) && g.HasRole(h, pubkey, "writer")
 }
 
 // SetMemberRoles updates the role cache for a member in a group.
@@ -750,10 +761,13 @@ func (g *GroupStore) CheckWrite(event nostr.Event) string {
 		} else if !g.Config.CanManage(event.PubKey) && !g.IsGroupCreator(h, event.PubKey) {
 			return "restricted: you are not authorized to manage groups"
 		}
-		// Only relay admins can set write-restricted on a group via metadata edit
-		if event.Kind == nostr.KindSimpleGroupEditMetadata &&
-			isWriteRestrictedGroupContent(event.Content) && !g.Config.CanManage(event.PubKey) {
-			return "restricted: only admins can set write-restricted on groups"
+		// Only relay admins can change the write-restricted flag on a group
+		if event.Kind == nostr.KindSimpleGroupEditMetadata && !g.Config.CanManage(event.PubKey) {
+			wasWriteRestricted := g.IsWriteRestricted(h)
+			willBeWriteRestricted := isWriteRestrictedGroupContent(event.Content)
+			if wasWriteRestricted != willBeWriteRestricted {
+				return "restricted: only admins can change write-restricted on groups"
+			}
 		}
 	}
 
