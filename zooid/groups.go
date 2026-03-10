@@ -2,6 +2,7 @@ package zooid
 
 import (
 	"encoding/json"
+	"sort"
 	"sync"
 
 	"fiatjaf.com/nostr"
@@ -151,12 +152,11 @@ func (g *GroupStore) WarmCaches() {
 			// Track roles from put-user events (positions 2+ in the p tag)
 			rs := g.getOrCreateRoleSet(h)
 			rs.mu.Lock()
-			if event.Kind == nostr.KindSimpleGroupPutUser {
-				roles := make(map[string]struct{})
+			if event.Kind == nostr.KindSimpleGroupPutUser && len(tag) > 2 {
+				roles := make(map[string]struct{}, len(tag)-2)
 				for i := 2; i < len(tag); i++ {
 					roles[tag[i]] = struct{}{}
 				}
-				// Always overwrite: a later put-user replaces previous roles
 				rs.roles[pubkey] = roles
 			} else {
 				delete(rs.roles, pubkey)
@@ -485,9 +485,12 @@ func (g *GroupStore) UpdateMembersList(h string) error {
 	for _, pubkey := range g.GetMembers(h) {
 		pTag := nostr.Tag{"p", pubkey.Hex()}
 		if roles, exists := roleSnapshot[pubkey]; exists {
+			sorted := make([]string, 0, len(roles))
 			for role := range roles {
-				pTag = append(pTag, role)
+				sorted = append(sorted, role)
 			}
+			sort.Strings(sorted)
+			pTag = append(pTag, sorted...)
 		}
 		tags = append(tags, pTag)
 	}
@@ -620,6 +623,10 @@ func (g *GroupStore) CanWrite(h string, pubkey nostr.PubKey) bool {
 // SetMemberRoles updates the role cache for a member in a group.
 // The roles slice replaces any previous roles for this pubkey.
 func (g *GroupStore) SetMemberRoles(h string, pubkey nostr.PubKey, roles []string) {
+	if len(roles) == 0 {
+		g.ClearMemberRoles(h, pubkey)
+		return
+	}
 	rs := g.getOrCreateRoleSet(h)
 	rs.mu.Lock()
 	roleMap := make(map[string]struct{}, len(roles))
