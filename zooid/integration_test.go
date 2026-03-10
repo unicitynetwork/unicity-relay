@@ -72,6 +72,8 @@ var (
 	adminPubkey    = adminSecret.Public()
 	nonAdminSecret = nostr.MustSecretKeyFromHex("0000000000000000000000000000000000000000000000000000000000000002")
 	nonAdminPubkey = nonAdminSecret.Public()
+	writerSecret   = nostr.MustSecretKeyFromHex("0000000000000000000000000000000000000000000000000000000000000003")
+	writerPubkey   = writerSecret.Public()
 	relaySecret    = nostr.MustSecretKeyFromHex("0000000000000000000000000000000000000000000000000000000000000099")
 )
 
@@ -2370,4 +2372,492 @@ func TestIntegration_CachedDeleteGroupClearsAccess(t *testing.T) {
 	}
 
 	t.Logf("Cache correctly cleared after group deletion")
+}
+
+// === Write-restricted group integration tests ===
+
+func TestIntegration_AdminCanCreateWriteRestrictedGroup(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	relay := setupRelayWithConfig(ctx, t, relayConfig{
+		adminCreateOnly:  false,
+		privateAdminOnly: true,
+	})
+	defer relay.Cleanup(ctx)
+
+	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
+	defer adminClient.close()
+
+	// Admin creates write-restricted group
+	createEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindCreateGroup),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "announcements"}},
+		Content:   `{"name":"Announcements","about":"Official updates","closed":true,"write-restricted":true}`,
+	}
+
+	result := adminClient.sendEvent(ctx, t, createEvent)
+	if result != "ok" {
+		t.Fatalf("Admin should be able to create write-restricted group, got: %s", result)
+	}
+
+	// Verify metadata has write-restricted tag
+	time.Sleep(100 * time.Millisecond)
+	filter := map[string]interface{}{
+		"kinds": []int{KindGroupMetadata},
+		"#d":    []string{"announcements"},
+	}
+
+	events := adminClient.subscribe(ctx, t, "wr-meta", filter)
+	if len(events) == 0 {
+		t.Fatal("Group metadata not found after creation")
+	}
+
+	// Check for write-restricted tag
+	foundWR := false
+	for _, tag := range events[0].Tags {
+		if len(tag) >= 1 && tag[0] == "write-restricted" {
+			foundWR = true
+			break
+		}
+	}
+	if !foundWR {
+		t.Errorf("Group metadata should contain write-restricted tag, tags: %v", events[0].Tags)
+	}
+
+	t.Logf("Admin successfully created write-restricted group")
+}
+
+func TestIntegration_NonAdminCannotCreateWriteRestrictedGroup(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	relay := setupRelayWithConfig(ctx, t, relayConfig{
+		adminCreateOnly:  false,
+		privateAdminOnly: true,
+	})
+	defer relay.Cleanup(ctx)
+
+	userClient := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
+	defer userClient.close()
+
+	// Non-admin tries to create write-restricted group
+	createEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindCreateGroup),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "user-announcements"}},
+		Content:   `{"name":"User Announcements","closed":true,"write-restricted":true}`,
+	}
+
+	result := userClient.sendEvent(ctx, t, createEvent)
+	if result == "ok" {
+		t.Fatal("Non-admin should NOT be able to create write-restricted group")
+	}
+
+	if !strings.Contains(result, "only admins can create write-restricted groups") {
+		t.Errorf("Expected 'only admins' rejection, got: %s", result)
+	}
+
+	t.Logf("Non-admin correctly rejected from creating write-restricted group: %s", result)
+}
+
+func TestIntegration_WriteRestrictedGroup_WriterCanPost(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	relay := setupRelayWithConfig(ctx, t, relayConfig{
+		adminCreateOnly:  false,
+		privateAdminOnly: true,
+	})
+	defer relay.Cleanup(ctx)
+
+	// Admin creates write-restricted group
+	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
+
+	createEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindCreateGroup),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wr-test"}},
+		Content:   `{"name":"WR Test","closed":true,"write-restricted":true}`,
+	}
+	result := adminClient.sendEvent(ctx, t, createEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to create group: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Grant writer role to writerPubkey via put-user with role
+	putUserEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindPutUser),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wr-test"}, {"p", writerPubkey.Hex(), "writer"}},
+	}
+	result = adminClient.sendEvent(ctx, t, putUserEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to grant writer role: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	adminClient.close()
+
+	// Writer connects and posts a message
+	writerClient := newNostrClient(ctx, t, relay.URI, writerSecret)
+	defer writerClient.close()
+
+	msgEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindGroupChatMessage),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wr-test"}},
+		Content:   "Announcement from writer",
+	}
+
+	result = writerClient.sendEvent(ctx, t, msgEvent)
+	if result != "ok" {
+		t.Fatalf("Writer with 'writer' role should be able to post, got: %s", result)
+	}
+
+	t.Logf("Writer with role successfully posted to write-restricted group")
+}
+
+func TestIntegration_WriteRestrictedGroup_RegularMemberCannotPost(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	relay := setupRelayWithConfig(ctx, t, relayConfig{
+		adminCreateOnly:  false,
+		privateAdminOnly: true,
+	})
+	defer relay.Cleanup(ctx)
+
+	// Admin creates write-restricted group
+	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
+
+	createEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindCreateGroup),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wr-readonly"}},
+		Content:   `{"name":"WR Readonly","closed":true,"write-restricted":true}`,
+	}
+	result := adminClient.sendEvent(ctx, t, createEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to create group: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Add nonAdmin as regular member (no writer role)
+	putUserEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindPutUser),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wr-readonly"}, {"p", nonAdminPubkey.Hex()}},
+	}
+	result = adminClient.sendEvent(ctx, t, putUserEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to add member: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	adminClient.close()
+
+	// Regular member tries to post
+	userClient := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
+	defer userClient.close()
+
+	msgEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindGroupChatMessage),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wr-readonly"}},
+		Content:   "I shouldn't be able to post this",
+	}
+
+	result = userClient.sendEvent(ctx, t, msgEvent)
+	if result == "ok" {
+		t.Fatal("Regular member should NOT be able to post in write-restricted group")
+	}
+
+	if !strings.Contains(result, "only allows designated writers") {
+		t.Errorf("Expected write-restricted rejection, got: %s", result)
+	}
+
+	t.Logf("Regular member correctly rejected: %s", result)
+}
+
+func TestIntegration_WriteRestrictedGroup_RegularMemberCanRead(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	relay := setupRelayWithConfig(ctx, t, relayConfig{
+		adminCreateOnly:  false,
+		privateAdminOnly: true,
+	})
+	defer relay.Cleanup(ctx)
+
+	// Admin creates write-restricted group and posts a message
+	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
+
+	createEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindCreateGroup),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wr-read"}},
+		Content:   `{"name":"WR Read Test","closed":true,"write-restricted":true}`,
+	}
+	result := adminClient.sendEvent(ctx, t, createEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to create group: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Add nonAdmin as regular member
+	putUserEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindPutUser),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wr-read"}, {"p", nonAdminPubkey.Hex()}},
+	}
+	result = adminClient.sendEvent(ctx, t, putUserEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to add member: %s", result)
+	}
+
+	// Admin posts a message
+	msgEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindGroupChatMessage),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wr-read"}},
+		Content:   "Admin announcement",
+	}
+	result = adminClient.sendEvent(ctx, t, msgEvent)
+	if result != "ok" {
+		t.Fatalf("Admin should be able to post: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	adminClient.close()
+
+	// Regular member reads messages
+	userClient := newNostrClient(ctx, t, relay.URI, nonAdminSecret)
+	defer userClient.close()
+
+	filter := map[string]interface{}{
+		"kinds": []int{KindGroupChatMessage},
+		"#h":    []string{"wr-read"},
+	}
+
+	events := userClient.subscribe(ctx, t, "wr-read-msg", filter)
+	if len(events) == 0 {
+		t.Fatal("Regular member should be able to read messages in write-restricted group")
+	}
+
+	if events[0].Content != "Admin announcement" {
+		t.Errorf("Expected 'Admin announcement', got: %s", events[0].Content)
+	}
+
+	t.Logf("Regular member can read %d message(s) from write-restricted group", len(events))
+}
+
+func TestIntegration_WriteRestrictedGroup_RevokeWriterRole(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	relay := setupRelayWithConfig(ctx, t, relayConfig{
+		adminCreateOnly:  false,
+		privateAdminOnly: true,
+	})
+	defer relay.Cleanup(ctx)
+
+	// Admin creates write-restricted group
+	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
+
+	createEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindCreateGroup),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wr-revoke"}},
+		Content:   `{"name":"WR Revoke Test","closed":true,"write-restricted":true}`,
+	}
+	result := adminClient.sendEvent(ctx, t, createEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to create group: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Grant writer role
+	putWriterEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindPutUser),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wr-revoke"}, {"p", writerPubkey.Hex(), "writer"}},
+	}
+	result = adminClient.sendEvent(ctx, t, putWriterEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to grant writer role: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Writer posts successfully
+	writerClient := newNostrClient(ctx, t, relay.URI, writerSecret)
+
+	msgEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindGroupChatMessage),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wr-revoke"}},
+		Content:   "Before revoke",
+	}
+	result = writerClient.sendEvent(ctx, t, msgEvent)
+	if result != "ok" {
+		t.Fatalf("Writer should be able to post before revoke, got: %s", result)
+	}
+	writerClient.close()
+
+	// Revoke writer role (re-add as member without role)
+	revokeEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindPutUser),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wr-revoke"}, {"p", writerPubkey.Hex()}},
+	}
+	result = adminClient.sendEvent(ctx, t, revokeEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to revoke writer role: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	adminClient.close()
+
+	// Writer tries to post again — should be rejected
+	writerClient2 := newNostrClient(ctx, t, relay.URI, writerSecret)
+	defer writerClient2.close()
+
+	msgEvent2 := &nostr.Event{
+		Kind:      nostr.Kind(KindGroupChatMessage),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wr-revoke"}},
+		Content:   "After revoke",
+	}
+	result = writerClient2.sendEvent(ctx, t, msgEvent2)
+	if result == "ok" {
+		t.Fatal("Writer should NOT be able to post after role revocation")
+	}
+
+	if !strings.Contains(result, "only allows designated writers") {
+		t.Errorf("Expected write-restricted rejection, got: %s", result)
+	}
+
+	t.Logf("Writer correctly rejected after role revocation: %s", result)
+}
+
+func TestIntegration_WriteRestrictedGroup_MembersListIncludesRoles(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping integration test in short mode")
+	}
+
+	ctx := context.Background()
+
+	relay := setupRelayWithConfig(ctx, t, relayConfig{
+		adminCreateOnly:  false,
+		privateAdminOnly: true,
+	})
+	defer relay.Cleanup(ctx)
+
+	adminClient := newNostrClient(ctx, t, relay.URI, adminSecret)
+	defer adminClient.close()
+
+	// Create write-restricted group
+	createEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindCreateGroup),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wr-members"}},
+		Content:   `{"name":"WR Members Test","closed":true,"write-restricted":true}`,
+	}
+	result := adminClient.sendEvent(ctx, t, createEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to create group: %s", result)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	// Add a writer
+	putWriterEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindPutUser),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wr-members"}, {"p", writerPubkey.Hex(), "writer"}},
+	}
+	result = adminClient.sendEvent(ctx, t, putWriterEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to add writer: %s", result)
+	}
+
+	// Add a regular member
+	putMemberEvent := &nostr.Event{
+		Kind:      nostr.Kind(KindPutUser),
+		CreatedAt: nostr.Now(),
+		Tags:      nostr.Tags{{"h", "wr-members"}, {"p", nonAdminPubkey.Hex()}},
+	}
+	result = adminClient.sendEvent(ctx, t, putMemberEvent)
+	if result != "ok" {
+		t.Fatalf("Failed to add member: %s", result)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+
+	// Query members list (kind 39002)
+	filter := map[string]interface{}{
+		"kinds": []int{KindGroupMembers},
+		"#d":    []string{"wr-members"},
+	}
+
+	events := adminClient.subscribe(ctx, t, "wr-members-list", filter)
+	if len(events) == 0 {
+		t.Fatal("Members list not found")
+	}
+
+	// Check that writer pubkey has "writer" role in the p tag
+	foundWriterWithRole := false
+	foundRegularMember := false
+	for _, tag := range events[0].Tags {
+		if len(tag) >= 2 && tag[0] == "p" {
+			if tag[1] == writerPubkey.Hex() {
+				if len(tag) >= 3 && tag[2] == "writer" {
+					foundWriterWithRole = true
+				} else {
+					t.Errorf("Writer pubkey found but without 'writer' role in tag: %v", tag)
+				}
+			}
+			if tag[1] == nonAdminPubkey.Hex() {
+				if len(tag) == 2 {
+					foundRegularMember = true
+				} else {
+					t.Logf("Regular member has unexpected extra data in tag: %v", tag)
+				}
+			}
+		}
+	}
+
+	if !foundWriterWithRole {
+		t.Errorf("Writer pubkey with 'writer' role not found in members list")
+	}
+	if !foundRegularMember {
+		t.Errorf("Regular member not found in members list")
+	}
+
+	t.Logf("Members list correctly includes roles")
 }

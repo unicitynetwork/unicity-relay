@@ -1,6 +1,7 @@
 package zooid
 
 import (
+	"encoding/json"
 	"testing"
 
 	"fiatjaf.com/nostr"
@@ -79,6 +80,70 @@ func TestGetInviteCodeFromEvent(t *testing.T) {
 			result := GetInviteCodeFromEvent(event)
 			if result != tt.want {
 				t.Errorf("GetInviteCodeFromEvent() = %v, want %v", result, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsWriteRestrictedGroupContentFunc(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{"write-restricted true", `{"name":"Test","write-restricted":true}`, true},
+		{"write-restricted false", `{"name":"Test","write-restricted":false}`, false},
+		{"no field", `{"name":"Test"}`, false},
+		{"empty", "", false},
+		{"invalid JSON", "not json", false},
+		{"string type", `{"write-restricted":"true"}`, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isWriteRestrictedGroupContent(tt.content)
+			if result != tt.want {
+				t.Errorf("isWriteRestrictedGroupContent(%q) = %v, want %v", tt.content, result, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsWriteRestrictedGroupContent(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    bool
+	}{
+		{
+			name:    "write-restricted true",
+			content: `{"name": "Announcements", "write-restricted": true}`,
+			want:    true,
+		},
+		{
+			name:    "write-restricted false",
+			content: `{"name": "Test", "write-restricted": false}`,
+			want:    false,
+		},
+		{
+			name:    "no write-restricted field",
+			content: `{"name": "Test"}`,
+			want:    false,
+		},
+		{
+			name:    "write-restricted with closed",
+			content: `{"name": "Announcements", "closed": true, "write-restricted": true}`,
+			want:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var data map[string]interface{}
+			json.Unmarshal([]byte(tt.content), &data)
+			wr, ok := data["write-restricted"].(bool)
+			result := ok && wr
+			if result != tt.want {
+				t.Errorf("write-restricted check for %q = %v, want %v", tt.content, result, tt.want)
 			}
 		})
 	}

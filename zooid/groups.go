@@ -12,6 +12,18 @@ import (
 // NIP-29 group invite kind
 const KindSimpleGroupCreateInvite nostr.Kind = 9009
 
+// isWriteRestrictedGroupContent checks if group content contains write-restricted:true
+func isWriteRestrictedGroupContent(content string) bool {
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(content), &data); err != nil {
+		return false
+	}
+	if wr, ok := data["write-restricted"].(bool); ok {
+		return wr
+	}
+	return false
+}
+
 // isPrivateGroupContent checks if group creation content contains private:true
 func isPrivateGroupContent(content string) bool {
 	var data map[string]interface{}
@@ -47,11 +59,17 @@ func GetGroupIDFromEvent(event nostr.Event) string {
 // Cache types
 
 type groupMetaCache struct {
-	event   nostr.Event
-	found   bool
-	private bool
-	hidden  bool
-	closed  bool
+	event           nostr.Event
+	found           bool
+	private         bool
+	hidden          bool
+	closed          bool
+	writeRestricted bool
+}
+
+type roleSet struct {
+	mu    sync.RWMutex
+	roles map[nostr.PubKey]map[string]struct{} // pubkey -> set of role names
 }
 
 type memberSet struct {
@@ -68,6 +86,7 @@ type GroupStore struct {
 
 	metadataCache   sync.Map // map[string]*groupMetaCache  (key = group h)
 	membershipCache sync.Map // map[string]*memberSet        (key = group h)
+	roleCache       sync.Map // map[string]*roleSet           (key = group h)
 	creatorCache    sync.Map // map[string]nostr.PubKey       (key = group h)
 	cachesWarmed    bool
 }
@@ -83,11 +102,12 @@ func (g *GroupStore) WarmCaches() {
 			continue
 		}
 		g.metadataCache.Store(h, &groupMetaCache{
-			event:   event,
-			found:   true,
-			private: HasTag(event.Tags, "private"),
-			hidden:  HasTag(event.Tags, "hidden"),
-			closed:  HasTag(event.Tags, "closed"),
+			event:           event,
+			found:           true,
+			private:         HasTag(event.Tags, "private"),
+			hidden:          HasTag(event.Tags, "hidden"),
+			closed:          HasTag(event.Tags, "closed"),
+			writeRestricted: HasTag(event.Tags, "write-restricted"),
 		})
 	}
 
@@ -127,6 +147,21 @@ func (g *GroupStore) WarmCaches() {
 				delete(ms.members, pubkey)
 			}
 			ms.mu.Unlock()
+
+			// Track roles from put-user events (positions 2+ in the p tag)
+			rs := g.getOrCreateRoleSet(h)
+			rs.mu.Lock()
+			if event.Kind == nostr.KindSimpleGroupPutUser {
+				roles := make(map[string]struct{})
+				for i := 2; i < len(tag); i++ {
+					roles[tag[i]] = struct{}{}
+				}
+				// Always overwrite: a later put-user replaces previous roles
+				rs.roles[pubkey] = roles
+			} else {
+				delete(rs.roles, pubkey)
+			}
+			rs.mu.Unlock()
 		}
 	}
 
@@ -140,6 +175,15 @@ func (g *GroupStore) getOrCreateMemberSet(h string) *memberSet {
 	ms := &memberSet{members: make(map[nostr.PubKey]struct{})}
 	actual, _ := g.membershipCache.LoadOrStore(h, ms)
 	return actual.(*memberSet)
+}
+
+func (g *GroupStore) getOrCreateRoleSet(h string) *roleSet {
+	if v, ok := g.roleCache.Load(h); ok {
+		return v.(*roleSet)
+	}
+	rs := &roleSet{roles: make(map[nostr.PubKey]map[string]struct{})}
+	actual, _ := g.roleCache.LoadOrStore(h, rs)
+	return actual.(*roleSet)
 }
 
 // Metadata
@@ -192,6 +236,9 @@ func (g *GroupStore) UpdateMetadata(event nostr.Event) error {
 		if hidden, ok := contentData["hidden"].(bool); ok && hidden {
 			tags = append(tags, nostr.Tag{"hidden"})
 		}
+		if wr, ok := contentData["write-restricted"].(bool); ok && wr {
+			tags = append(tags, nostr.Tag{"write-restricted"})
+		}
 	}
 
 	metadataEvent := nostr.Event{
@@ -207,11 +254,12 @@ func (g *GroupStore) UpdateMetadata(event nostr.Event) error {
 
 	if h != "" {
 		g.metadataCache.Store(h, &groupMetaCache{
-			event:   metadataEvent,
-			found:   true,
-			private: HasTag(tags, "private"),
-			hidden:  HasTag(tags, "hidden"),
-			closed:  HasTag(tags, "closed"),
+			event:           metadataEvent,
+			found:           true,
+			private:         HasTag(tags, "private"),
+			hidden:          HasTag(tags, "hidden"),
+			closed:          HasTag(tags, "closed"),
+			writeRestricted: HasTag(tags, "write-restricted"),
 		})
 	}
 
@@ -250,6 +298,7 @@ func (g *GroupStore) DeleteGroup(h string) {
 
 	g.metadataCache.Delete(h)
 	g.membershipCache.Delete(h)
+	g.roleCache.Delete(h)
 	g.creatorCache.Delete(h)
 }
 
@@ -417,7 +466,19 @@ func (g *GroupStore) UpdateMembersList(h string) error {
 	}
 
 	for _, pubkey := range g.GetMembers(h) {
-		tags = append(tags, nostr.Tag{"p", pubkey.Hex()})
+		pTag := nostr.Tag{"p", pubkey.Hex()}
+		// Append roles if any exist in the role cache
+		if v, ok := g.roleCache.Load(h); ok {
+			rs := v.(*roleSet)
+			rs.mu.RLock()
+			if roles, exists := rs.roles[pubkey]; exists {
+				for role := range roles {
+					pTag = append(pTag, role)
+				}
+			}
+			rs.mu.RUnlock()
+		}
+		tags = append(tags, pTag)
 	}
 
 	event := nostr.Event{
@@ -500,6 +561,72 @@ func (g *GroupStore) GetGroupCreator(h string) nostr.PubKey {
 
 func (g *GroupStore) IsGroupCreator(h string, pubkey nostr.PubKey) bool {
 	return g.GetGroupCreator(h) == pubkey
+}
+
+// Write restriction helpers
+
+func (g *GroupStore) IsWriteRestricted(h string) bool {
+	if g.cachesWarmed {
+		if v, ok := g.metadataCache.Load(h); ok {
+			return v.(*groupMetaCache).writeRestricted
+		}
+		return false
+	}
+
+	meta, found := g.GetMetadata(h)
+	if !found {
+		return false
+	}
+	return HasTag(meta.Tags, "write-restricted")
+}
+
+func (g *GroupStore) HasRole(h string, pubkey nostr.PubKey, role string) bool {
+	if v, ok := g.roleCache.Load(h); ok {
+		rs := v.(*roleSet)
+		rs.mu.RLock()
+		defer rs.mu.RUnlock()
+		if roles, exists := rs.roles[pubkey]; exists {
+			_, has := roles[role]
+			return has
+		}
+	}
+	return false
+}
+
+// CanWrite checks if a user can post content to a write-restricted group.
+// Returns true if the group is not write-restricted, or if the user is an
+// admin, group creator, or has the "writer" role.
+func (g *GroupStore) CanWrite(h string, pubkey nostr.PubKey) bool {
+	if !g.IsWriteRestricted(h) {
+		return true
+	}
+	if g.Config.CanManage(pubkey) || g.IsGroupCreator(h, pubkey) {
+		return true
+	}
+	return g.HasRole(h, pubkey, "writer")
+}
+
+// SetMemberRoles updates the role cache for a member in a group.
+// The roles slice replaces any previous roles for this pubkey.
+func (g *GroupStore) SetMemberRoles(h string, pubkey nostr.PubKey, roles []string) {
+	rs := g.getOrCreateRoleSet(h)
+	rs.mu.Lock()
+	roleMap := make(map[string]struct{}, len(roles))
+	for _, r := range roles {
+		roleMap[r] = struct{}{}
+	}
+	rs.roles[pubkey] = roleMap
+	rs.mu.Unlock()
+}
+
+// ClearMemberRoles removes all roles for a member in a group.
+func (g *GroupStore) ClearMemberRoles(h string, pubkey nostr.PubKey) {
+	if v, ok := g.roleCache.Load(h); ok {
+		rs := v.(*roleSet)
+		rs.mu.Lock()
+		delete(rs.roles, pubkey)
+		rs.mu.Unlock()
+	}
 }
 
 // Other stuff
@@ -604,6 +731,10 @@ func (g *GroupStore) CheckWrite(event nostr.Event) string {
 				return "restricted: only admins can create private groups"
 			}
 		}
+		// Write-restricted groups can only be created by relay admins
+		if isWriteRestrictedGroupContent(event.Content) && !g.Config.CanManage(event.PubKey) {
+			return "restricted: only admins can create write-restricted groups"
+		}
 		// Group creation check passed, don't apply general ModerationEventKinds check
 		return ""
 	} else if !found {
@@ -618,6 +749,11 @@ func (g *GroupStore) CheckWrite(event nostr.Event) string {
 			}
 		} else if !g.Config.CanManage(event.PubKey) && !g.IsGroupCreator(h, event.PubKey) {
 			return "restricted: you are not authorized to manage groups"
+		}
+		// Only relay admins can set write-restricted on a group via metadata edit
+		if event.Kind == nostr.KindSimpleGroupEditMetadata &&
+			isWriteRestrictedGroupContent(event.Content) && !g.Config.CanManage(event.PubKey) {
+			return "restricted: only admins can set write-restricted on groups"
 		}
 	}
 
@@ -660,6 +796,11 @@ func (g *GroupStore) CheckWrite(event nostr.Event) string {
 
 	if HasTag(meta.Tags, "closed") && !g.HasAccess(h, event.PubKey) {
 		return "restricted: you are not a member of that group"
+	}
+
+	// Write-restricted check: only users with "writer" role, admins, or creator can post
+	if HasTag(meta.Tags, "write-restricted") && !g.CanWrite(h, event.PubKey) {
+		return "restricted: this group only allows designated writers to post"
 	}
 
 	return ""

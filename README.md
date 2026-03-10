@@ -27,6 +27,24 @@ Added configurable group creation policies and private group access control:
 - `private_admin_only` — only relay admins can create private groups (public groups open to all)
 - `private_relay_admin_access` — when `false`, relay admins cannot see or moderate private groups; only the group creator can moderate their own private group
 
+### Per-Group Write Permissions (Write-Restricted Groups)
+
+Added support for write-restricted groups (announcement channels). A group with the `write-restricted` metadata flag only allows designated writers, admins, and the group creator to post. Regular members can read but not write.
+
+- Uses NIP-29 roles on put-user events (kind 9000) — the `writer` role designates who can post
+- Only relay admins can create or set `write-restricted` on groups
+- Roles are tracked in a separate in-memory cache alongside the membership cache
+- The group members list (kind 39002) includes role information in p-tags
+- Combine with `closed` for public announcement channels (anyone can join and read, only writers can post)
+
+Create a write-restricted group via the [groupchat CLI](https://github.com/unicity-sphere/sphere-infra/tree/main/groupchat-cli):
+
+```bash
+node create-group.js "Announcements" "Official updates" --write-restricted --writer <pubkey>
+node manage-writers.js add announcements <pubkey>
+node manage-writers.js remove announcements <pubkey>
+```
+
 ### Configuration for Sphere
 
 The relay is configured with:
@@ -88,6 +106,8 @@ Configures NIP 29 support.
 - `admin_create_only` - only relay admins can create groups. Defaults to `true`.
 - `private_admin_only` - only relay admins can create private groups. Defaults to `true`.
 - `private_relay_admin_access` - relay admins can see and moderate private groups. When `false`, only the group creator can moderate their private group. Defaults to `false`.
+
+Groups also support a `write-restricted` metadata flag (set in the group creation content JSON). When set, only members with the `writer` role, relay admins, and the group creator can post. The `writer` role is assigned via kind 9000 (put-user) events with `["p", "<pubkey>", "writer"]` tags. Only relay admins can create write-restricted groups or add the flag to existing groups.
 
 ### `[management]`
 

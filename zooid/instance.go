@@ -421,20 +421,27 @@ func (instance *Instance) OnEventSaved(ctx context.Context, event nostr.Event) {
 	}
 
 	if event.Kind == nostr.KindSimpleGroupPutUser {
-		// Update membership cache for externally-received PutUser events
+		// Update membership and role caches for externally-received PutUser events
 		for tag := range event.Tags.FindAll("p") {
 			if pubkey, err := nostr.PubKeyFromHex(tag[1]); err == nil {
 				ms := instance.Groups.getOrCreateMemberSet(h)
 				ms.mu.Lock()
 				ms.members[pubkey] = struct{}{}
 				ms.mu.Unlock()
+
+				// Extract roles from p-tag positions 2+ and update role cache
+				roles := make([]string, 0, len(tag)-2)
+				for i := 2; i < len(tag); i++ {
+					roles = append(roles, tag[i])
+				}
+				instance.Groups.SetMemberRoles(h, pubkey, roles)
 			}
 		}
 		instance.Groups.UpdateMembersList(h)
 	}
 
 	if event.Kind == nostr.KindSimpleGroupRemoveUser {
-		// Update membership cache for externally-received RemoveUser events
+		// Update membership and role caches for externally-received RemoveUser events
 		if v, ok := instance.Groups.membershipCache.Load(h); ok {
 			ms := v.(*memberSet)
 			for tag := range event.Tags.FindAll("p") {
@@ -442,6 +449,7 @@ func (instance *Instance) OnEventSaved(ctx context.Context, event nostr.Event) {
 					ms.mu.Lock()
 					delete(ms.members, pubkey)
 					ms.mu.Unlock()
+					instance.Groups.ClearMemberRoles(h, pubkey)
 				}
 			}
 		}
