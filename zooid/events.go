@@ -54,6 +54,8 @@ func (events *EventStore) Init() error {
 		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_event_tags_event_id ON {{.Name}}__event_tags(event_id)`),
 		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_event_tags_key ON {{.Name}}__event_tags(key)`),
 		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_event_tags_key_value ON {{.Name}}__event_tags(key, value)`),
+		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_event_tags_key_value_event_id ON {{.Name}}__event_tags(key, value, event_id)`),
+		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_events_kind_created_at ON {{.Name}}__events(kind, created_at DESC)`),
 	}
 
 	for _, stmt := range statements {
@@ -66,10 +68,6 @@ func (events *EventStore) Init() error {
 		return fmt.Errorf("FTS init failed: %w", err)
 	}
 
-	if err := events.ensureCoveringIndexes(); err != nil {
-		return fmt.Errorf("covering indexes failed: %w", err)
-	}
-
 	if err := RunMigrations(events.Schema); err != nil {
 		return fmt.Errorf("migrations failed: %w", err)
 	}
@@ -77,89 +75,6 @@ func (events *EventStore) Init() error {
 	return nil
 }
 
-// ensureCoveringIndexes creates performance-critical indexes, repairing any
-// that were left INVALID by a prior failed CREATE INDEX CONCURRENTLY.
-// Unlike CREATE INDEX IF NOT EXISTS (which skips INVALID indexes), this
-// explicitly drops invalid indexes first, then recreates them.
-func (events *EventStore) ensureCoveringIndexes() error {
-	type idx struct {
-		name string
-		ddl  string
-	}
-
-	indexes := []idx{
-		{
-			name: events.Schema.Render(`{{.Name}}__idx_event_tags_key_value_event_id`),
-			ddl:  events.Schema.Render(`CREATE INDEX {{.Name}}__idx_event_tags_key_value_event_id ON {{.Name}}__event_tags(key, value, event_id)`),
-		},
-		{
-			name: events.Schema.Render(`{{.Name}}__idx_events_kind_created_at`),
-			ddl:  events.Schema.Render(`CREATE INDEX {{.Name}}__idx_events_kind_created_at ON {{.Name}}__events(kind, created_at DESC)`),
-		},
-	}
-
-	db := GetDb()
-	needsCreate := false
-	for _, ix := range indexes {
-		// Check if index exists and whether it's valid.
-		var valid bool
-		err := db.QueryRow(`
-			SELECT i.indisvalid
-			FROM pg_class c
-			JOIN pg_index i ON i.indexrelid = c.oid
-			WHERE c.relname = lower($1)
-		`, ix.name).Scan(&valid)
-
-		switch {
-		case err == nil && valid:
-			log.Printf("Index %s: OK", ix.name)
-			continue
-		case err == nil && !valid:
-			// INVALID index left by a failed CONCURRENTLY — drop it first.
-			log.Printf("Index %s is INVALID, dropping...", ix.name)
-			if _, err := db.Exec("DROP INDEX IF EXISTS " + ix.name); err != nil {
-				return fmt.Errorf("dropping invalid index %s: %w", ix.name, err)
-			}
-			needsCreate = true
-		default:
-			// Doesn't exist (sql.ErrNoRows) or other error — create it.
-			log.Printf("Index %s not found, creating...", ix.name)
-			needsCreate = true
-		}
-
-		log.Printf("Creating index %s (DDL: %s)...", ix.name, ix.ddl)
-		if _, err := db.Exec(ix.ddl); err != nil {
-			return fmt.Errorf("creating index %s: %w\nDDL was: %s", ix.name, err, ix.ddl)
-		}
-
-		// Verify the index actually exists after CREATE returned success.
-		// Guards against silent driver-level failures.
-		var check bool
-		if err := db.QueryRow(`
-			SELECT TRUE FROM pg_class c
-			JOIN pg_index i ON i.indexrelid = c.oid
-			WHERE c.relname = lower($1) AND i.indisvalid
-		`, ix.name).Scan(&check); err != nil {
-			return fmt.Errorf("index %s: CREATE returned success but index not found in pg_class — possible driver issue", ix.name)
-		}
-		log.Printf("Index %s: created and verified", ix.name)
-	}
-
-	// If we had to create any indexes, clear the stale migration marker so
-	// RunMigrations doesn't think 001_covering_indexes.sql already ran
-	// successfully (it may have been marked "applied" by a prior deploy
-	// where the actual CREATE INDEX silently failed).
-	if needsCreate {
-		kvKey := fmt.Sprintf("migration:%s:001_covering_indexes.sql", events.Schema.Name)
-		GetKeyValueStore().Set(kvKey, "applied")
-	}
-
-	// Update planner statistics so the planner knows about the new indexes.
-	db.Exec(events.Schema.Render(`ANALYZE {{.Name}}__event_tags`))
-	db.Exec(events.Schema.Render(`ANALYZE {{.Name}}__events`))
-
-	return nil
-}
 
 func (events *EventStore) initFTS() error {
 	ftsStatements := []string{
