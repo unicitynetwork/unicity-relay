@@ -33,7 +33,7 @@ func TestRunMigrations_Idempotent(t *testing.T) {
 	}
 }
 
-func TestRunMigrations_IndexesExistAndValid(t *testing.T) {
+func TestEnsureCoveringIndexes_ExistAndValid(t *testing.T) {
 	store := createTestEventStore()
 	store.Init()
 
@@ -61,33 +61,41 @@ func TestRunMigrations_IndexesExistAndValid(t *testing.T) {
 	}
 }
 
-func TestRunMigrations_RepairsInvalidIndex(t *testing.T) {
+func TestEnsureCoveringIndexes_RepairsInvalid(t *testing.T) {
 	store := createTestEventStore()
 	store.Init()
 
 	db := GetDb()
-	idxName := store.Schema.Prefix("idx_event_tags_key_value_event_id")
+	idxName := strings.ToLower(store.Schema.Prefix("idx_event_tags_key_value_event_id"))
 
-	// Simulate an INVALID index by marking it invalid in pg_index.
-	// (In production this happens when CREATE INDEX CONCURRENTLY fails.)
+	// Simulate an INVALID index (happens when CREATE INDEX CONCURRENTLY fails).
 	db.Exec(fmt.Sprintf(`
 		UPDATE pg_index SET indisvalid = false
 		WHERE indexrelid = (SELECT oid FROM pg_class WHERE relname = '%s')
-	`, strings.ToLower(idxName)))
+	`, idxName))
 
-	// RunMigrations should detect and repair it.
-	if err := RunMigrations(store.Schema); err != nil {
-		t.Fatalf("RunMigrations with invalid index: %v", err)
+	// Verify it's now invalid.
+	var valid bool
+	db.QueryRow(`
+		SELECT pg_index.indisvalid FROM pg_class
+		JOIN pg_index ON pg_index.indexrelid = pg_class.oid
+		WHERE pg_class.relname = $1
+	`, idxName).Scan(&valid)
+	if valid {
+		t.Skip("Could not mark index as invalid (may require superuser)")
+	}
+
+	// ensureCoveringIndexes should detect and repair it.
+	if err := store.ensureCoveringIndexes(); err != nil {
+		t.Fatalf("ensureCoveringIndexes with invalid index: %v", err)
 	}
 
 	// Verify it's valid now.
-	var valid bool
 	err := db.QueryRow(`
-		SELECT pg_index.indisvalid
-		FROM pg_class
+		SELECT pg_index.indisvalid FROM pg_class
 		JOIN pg_index ON pg_index.indexrelid = pg_class.oid
 		WHERE pg_class.relname = $1
-	`, strings.ToLower(idxName)).Scan(&valid)
+	`, idxName).Scan(&valid)
 	if err != nil {
 		t.Fatalf("Index not found after repair: %v", err)
 	}
