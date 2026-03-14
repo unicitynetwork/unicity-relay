@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"iter"
 	"log"
+	"sort"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/eventstore"
@@ -64,6 +65,11 @@ func (events *EventStore) Init() error {
 	if err := events.initFTS(); err != nil {
 		return fmt.Errorf("FTS init failed: %w", err)
 	}
+
+	if err := RunMigrations(events.Schema); err != nil {
+		return fmt.Errorf("migrations failed: %w", err)
+	}
+
 	return nil
 }
 
@@ -171,13 +177,61 @@ func (events *EventStore) queryEventsWith(runner squirrel.BaseRunner, filter nos
 }
 
 func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectBuilder {
-	qb := sb.Select("id", "created_at", "kind", "pubkey", "content", "tags", "sig").
-		From(events.Schema.Prefix("events")).
-		OrderBy("created_at DESC")
+	eventsTable := events.Schema.Prefix("events")
+	eventTagsTable := events.Schema.Prefix("event_tags")
 
-	// Handle search with tsvector FTS
+	// Collect valid single-letter tag filters for JOIN rewriting.
+	type tagFilter struct {
+		key    string
+		values []interface{}
+	}
+	var tagFilters []tagFilter
+	for tagKey, tagValues := range filter.Tags {
+		if len(tagValues) == 0 || len(tagKey) != 1 {
+			continue
+		}
+		vals := make([]interface{}, len(tagValues))
+		for i, v := range tagValues {
+			vals[i] = v
+		}
+		tagFilters = append(tagFilters, tagFilter{key: tagKey, values: vals})
+	}
+	// Deterministic JOIN alias order (map iteration is random).
+	sort.Slice(tagFilters, func(i, j int) bool {
+		return tagFilters[i].key < tagFilters[j].key
+	})
+
+	// When tag filters are present, use JOINs instead of IN-subqueries.
+	// This guides the planner to start from the smaller event_tags result
+	// set (via the covering index) rather than scanning the full events
+	// table backward by created_at.
+	col := "" // column qualifier: "" when no JOINs, "e." with JOINs
+	var qb squirrel.SelectBuilder
+
+	if len(tagFilters) > 0 {
+		col = "e."
+		qb = sb.Select(
+			"DISTINCT e.id", "e.created_at", "e.kind", "e.pubkey",
+			"e.content", "e.tags", "e.sig",
+		).From(eventsTable + " e")
+
+		for i, tf := range tagFilters {
+			alias := fmt.Sprintf("t%d", i)
+			qb = qb.Join(fmt.Sprintf(
+				"%s %s ON %s.event_id = e.id", eventTagsTable, alias, alias,
+			))
+			qb = qb.Where(squirrel.Eq{alias + ".key": tf.key})
+			qb = qb.Where(squirrel.Eq{alias + ".value": tf.values})
+		}
+	} else {
+		qb = sb.Select("id", "created_at", "kind", "pubkey", "content", "tags", "sig").
+			From(eventsTable)
+	}
+
+	qb = qb.OrderBy(col + "created_at DESC")
+
 	if filter.Search != "" {
-		qb = qb.Where("search_vector @@ plainto_tsquery('english', ?)", filter.Search)
+		qb = qb.Where(col+"search_vector @@ plainto_tsquery('english', ?)", filter.Search)
 	}
 
 	if len(filter.IDs) > 0 {
@@ -185,7 +239,7 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectB
 		for i, id := range filter.IDs {
 			idStrs[i] = id.Hex()
 		}
-		qb = qb.Where(squirrel.Eq{"id": idStrs})
+		qb = qb.Where(squirrel.Eq{col + "id": idStrs})
 	}
 
 	if len(filter.Authors) > 0 {
@@ -193,7 +247,7 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectB
 		for i, author := range filter.Authors {
 			authorStrs[i] = author.Hex()
 		}
-		qb = qb.Where(squirrel.Eq{"pubkey": authorStrs})
+		qb = qb.Where(squirrel.Eq{col + "pubkey": authorStrs})
 	}
 
 	if len(filter.Kinds) > 0 {
@@ -201,41 +255,15 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectB
 		for i, kind := range filter.Kinds {
 			kindInts[i] = int(kind)
 		}
-		qb = qb.Where(squirrel.Eq{"kind": kindInts})
+		qb = qb.Where(squirrel.Eq{col + "kind": kindInts})
 	}
 
 	if filter.Since != 0 {
-		qb = qb.Where(squirrel.GtOrEq{"created_at": filter.Since})
+		qb = qb.Where(squirrel.GtOrEq{col + "created_at": filter.Since})
 	}
 
 	if filter.Until != 0 {
-		qb = qb.Where(squirrel.LtOrEq{"created_at": filter.Until})
-	}
-
-	for tagKey, tagValues := range filter.Tags {
-		if len(tagValues) == 0 {
-			continue
-		}
-
-		if len(tagKey) != 1 {
-			continue
-		}
-
-		tagValueInterfaces := make([]interface{}, len(tagValues))
-		for i, tagValue := range tagValues {
-			tagValueInterfaces[i] = tagValue
-		}
-
-		// Use Question format for the sub-query so that when its SQL is embedded
-		// into the outer Dollar-format query, the ? placeholders get properly
-		// renumbered to $N by the outer builder.
-		subQuery := squirrel.Select("event_id").
-			From(events.Schema.Prefix("event_tags")).
-			Where(squirrel.Eq{"key": tagKey}).
-			Where(squirrel.Eq{"value": tagValueInterfaces})
-
-		subQuerySql, subQueryArgs, _ := subQuery.ToSql()
-		qb = qb.Where("id IN ("+subQuerySql+")", subQueryArgs...)
+		qb = qb.Where(squirrel.LtOrEq{col + "created_at": filter.Until})
 	}
 
 	if filter.Limit > 0 {
