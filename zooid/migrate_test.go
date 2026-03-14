@@ -33,31 +33,65 @@ func TestRunMigrations_Idempotent(t *testing.T) {
 	}
 }
 
-func TestRunMigrations_IndexesExist(t *testing.T) {
+func TestRunMigrations_IndexesExistAndValid(t *testing.T) {
 	store := createTestEventStore()
 	store.Init()
 
 	// PostgreSQL lowercases unquoted identifiers in system catalogs.
-	coveringIdx := strings.ToLower(store.Schema.Prefix("idx_event_tags_key_value_event_id"))
-	var count int
-	err := GetDb().QueryRow(
-		"SELECT COUNT(*) FROM pg_indexes WHERE indexname = $1", coveringIdx,
-	).Scan(&count)
-	if err != nil {
-		t.Fatalf("Failed to query pg_indexes: %v", err)
-	}
-	if count != 1 {
-		t.Errorf("Covering index %s not found in pg_indexes", coveringIdx)
+	indexes := []string{
+		strings.ToLower(store.Schema.Prefix("idx_event_tags_key_value_event_id")),
+		strings.ToLower(store.Schema.Prefix("idx_events_kind_created_at")),
 	}
 
-	compositeIdx := strings.ToLower(store.Schema.Prefix("idx_events_kind_created_at"))
-	err = GetDb().QueryRow(
-		"SELECT COUNT(*) FROM pg_indexes WHERE indexname = $1", compositeIdx,
-	).Scan(&count)
-	if err != nil {
-		t.Fatalf("Failed to query pg_indexes: %v", err)
+	for _, idx := range indexes {
+		var valid bool
+		err := GetDb().QueryRow(`
+			SELECT pg_index.indisvalid
+			FROM pg_class
+			JOIN pg_index ON pg_index.indexrelid = pg_class.oid
+			WHERE pg_class.relname = $1
+		`, idx).Scan(&valid)
+		if err != nil {
+			t.Errorf("Index %s not found: %v", idx, err)
+			continue
+		}
+		if !valid {
+			t.Errorf("Index %s exists but is INVALID", idx)
+		}
 	}
-	if count != 1 {
-		t.Errorf("Composite index %s not found in pg_indexes", compositeIdx)
+}
+
+func TestRunMigrations_RepairsInvalidIndex(t *testing.T) {
+	store := createTestEventStore()
+	store.Init()
+
+	db := GetDb()
+	idxName := store.Schema.Prefix("idx_event_tags_key_value_event_id")
+
+	// Simulate an INVALID index by marking it invalid in pg_index.
+	// (In production this happens when CREATE INDEX CONCURRENTLY fails.)
+	db.Exec(fmt.Sprintf(`
+		UPDATE pg_index SET indisvalid = false
+		WHERE indexrelid = (SELECT oid FROM pg_class WHERE relname = '%s')
+	`, strings.ToLower(idxName)))
+
+	// RunMigrations should detect and repair it.
+	if err := RunMigrations(store.Schema); err != nil {
+		t.Fatalf("RunMigrations with invalid index: %v", err)
+	}
+
+	// Verify it's valid now.
+	var valid bool
+	err := db.QueryRow(`
+		SELECT pg_index.indisvalid
+		FROM pg_class
+		JOIN pg_index ON pg_index.indexrelid = pg_class.oid
+		WHERE pg_class.relname = $1
+	`, strings.ToLower(idxName)).Scan(&valid)
+	if err != nil {
+		t.Fatalf("Index not found after repair: %v", err)
+	}
+	if !valid {
+		t.Error("Index should be valid after repair")
 	}
 }
