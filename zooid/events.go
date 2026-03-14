@@ -177,10 +177,53 @@ func (events *EventStore) queryEventsWith(runner squirrel.BaseRunner, filter nos
 }
 
 func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectBuilder {
-	eventsTable := events.Schema.Prefix("events")
-	eventTagsTable := events.Schema.Prefix("event_tags")
+	qb := sb.Select("id", "created_at", "kind", "pubkey", "content", "tags", "sig").
+		From(events.Schema.Prefix("events")).
+		OrderBy("created_at DESC")
 
-	// Collect valid single-letter tag filters for JOIN rewriting.
+	// Handle search with tsvector FTS
+	if filter.Search != "" {
+		qb = qb.Where("search_vector @@ plainto_tsquery('english', ?)", filter.Search)
+	}
+
+	if len(filter.IDs) > 0 {
+		idStrs := make([]interface{}, len(filter.IDs))
+		for i, id := range filter.IDs {
+			idStrs[i] = id.Hex()
+		}
+		qb = qb.Where(squirrel.Eq{"id": idStrs})
+	}
+
+	if len(filter.Authors) > 0 {
+		authorStrs := make([]interface{}, len(filter.Authors))
+		for i, author := range filter.Authors {
+			authorStrs[i] = author.Hex()
+		}
+		qb = qb.Where(squirrel.Eq{"pubkey": authorStrs})
+	}
+
+	if len(filter.Kinds) > 0 {
+		kindInts := make([]interface{}, len(filter.Kinds))
+		for i, kind := range filter.Kinds {
+			kindInts[i] = int(kind)
+		}
+		qb = qb.Where(squirrel.Eq{"kind": kindInts})
+	}
+
+	if filter.Since != 0 {
+		qb = qb.Where(squirrel.GtOrEq{"created_at": filter.Since})
+	}
+
+	if filter.Until != 0 {
+		qb = qb.Where(squirrel.LtOrEq{"created_at": filter.Until})
+	}
+
+	// Tag filters use IN-subqueries against event_tags. The covering index
+	// (key, value, event_id) enables index-only scans on these subqueries,
+	// making the planner prefer a hash semi-join over a full events scan.
+	//
+	// Collect and sort tag filters for deterministic SQL output (Go map
+	// iteration order is random).
 	type tagFilter struct {
 		key    string
 		values []interface{}
@@ -196,74 +239,18 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectB
 		}
 		tagFilters = append(tagFilters, tagFilter{key: tagKey, values: vals})
 	}
-	// Deterministic JOIN alias order (map iteration is random).
 	sort.Slice(tagFilters, func(i, j int) bool {
 		return tagFilters[i].key < tagFilters[j].key
 	})
 
-	// When tag filters are present, use JOINs instead of IN-subqueries.
-	// This guides the planner to start from the smaller event_tags result
-	// set (via the covering index) rather than scanning the full events
-	// table backward by created_at.
-	col := "" // column qualifier: "" when no JOINs, "e." with JOINs
-	var qb squirrel.SelectBuilder
+	for _, tf := range tagFilters {
+		subQuery := squirrel.Select("event_id").
+			From(events.Schema.Prefix("event_tags")).
+			Where(squirrel.Eq{"key": tf.key}).
+			Where(squirrel.Eq{"value": tf.values})
 
-	if len(tagFilters) > 0 {
-		col = "e."
-		qb = sb.Select(
-			"DISTINCT e.id", "e.created_at", "e.kind", "e.pubkey",
-			"e.content", "e.tags", "e.sig",
-		).From(eventsTable + " e")
-
-		for i, tf := range tagFilters {
-			alias := fmt.Sprintf("t%d", i)
-			qb = qb.Join(fmt.Sprintf(
-				"%s %s ON %s.event_id = e.id", eventTagsTable, alias, alias,
-			))
-			qb = qb.Where(squirrel.Eq{alias + ".key": tf.key})
-			qb = qb.Where(squirrel.Eq{alias + ".value": tf.values})
-		}
-	} else {
-		qb = sb.Select("id", "created_at", "kind", "pubkey", "content", "tags", "sig").
-			From(eventsTable)
-	}
-
-	qb = qb.OrderBy(col + "created_at DESC")
-
-	if filter.Search != "" {
-		qb = qb.Where(col+"search_vector @@ plainto_tsquery('english', ?)", filter.Search)
-	}
-
-	if len(filter.IDs) > 0 {
-		idStrs := make([]interface{}, len(filter.IDs))
-		for i, id := range filter.IDs {
-			idStrs[i] = id.Hex()
-		}
-		qb = qb.Where(squirrel.Eq{col + "id": idStrs})
-	}
-
-	if len(filter.Authors) > 0 {
-		authorStrs := make([]interface{}, len(filter.Authors))
-		for i, author := range filter.Authors {
-			authorStrs[i] = author.Hex()
-		}
-		qb = qb.Where(squirrel.Eq{col + "pubkey": authorStrs})
-	}
-
-	if len(filter.Kinds) > 0 {
-		kindInts := make([]interface{}, len(filter.Kinds))
-		for i, kind := range filter.Kinds {
-			kindInts[i] = int(kind)
-		}
-		qb = qb.Where(squirrel.Eq{col + "kind": kindInts})
-	}
-
-	if filter.Since != 0 {
-		qb = qb.Where(squirrel.GtOrEq{col + "created_at": filter.Since})
-	}
-
-	if filter.Until != 0 {
-		qb = qb.Where(squirrel.LtOrEq{col + "created_at": filter.Until})
+		subQuerySql, subQueryArgs, _ := subQuery.ToSql()
+		qb = qb.Where("id IN ("+subQuerySql+")", subQueryArgs...)
 	}
 
 	if filter.Limit > 0 {
