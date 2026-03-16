@@ -1,0 +1,25 @@
+services:
+  relay:
+    build: .
+    ports:
+      - "3334:3334"
+    environment:
+      DATABASE_URL: postgres://zooid:dev@postgres:5432/zooid?sslmode=disable
+      RELAY_HOST: localhost
+      RELAY_SECRET: ${RELAY_SECRET}
+    depends_on:
+      - postgres
+    volumes:
+      - ./config:/app/config
+      - ./media:/app/media
+
+  alloy:
+    image: grafana/alloy:latest
+    ports:
+      - "12345:12345"
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy
+    environment:
+      - GRAFANA_REMOTE_WRITE_URL
+      - GRAFANA_USERNAME
+      - GRAFANA_API_TOKEN

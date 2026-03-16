@@ -274,7 +274,48 @@ All metrics carry an `instance` label (hardcoded to `g-relay` for the groupchat 
 | `zooid_messages_total` | Gauge | Total chat messages (kinds 9, 10) in database |
 | `zooid_query_duration_seconds` | Histogram | Duration of database queries |
 
+### Forwarding to Grafana Cloud with Alloy
+
+The repo includes a [Grafana Alloy](https://grafana.com/docs/alloy/) config that scrapes the relay and forwards metrics to Grafana Cloud via `remote_write`. The setup lives in `docker-compose.metrics.yml` and `alloy/config.alloy`.
+
+**1. Get your Grafana Cloud credentials** from your stack's Prometheus connection details (remote write URL, username, API token).
+
+**2. Start the relay and Alloy together:**
+
+```bash
+export RELAY_SECRET="$(openssl rand -hex 32)"
+export GRAFANA_REMOTE_WRITE_URL="https://prometheus-prod-XX-prod.grafana.net/api/prom/push"
+export GRAFANA_USERNAME="123456"
+export GRAFANA_API_TOKEN="glc_..."
+
+docker compose -f docker-compose.yml -f docker-compose.metrics.yml up --build
+```
+
+This starts postgres, builds/runs the relay, and starts Alloy — all on the same Docker network. Alloy scrapes `relay:3334/metrics` every 15 seconds.
+
+**3. To run Alloy standalone** (e.g. while running the relay on the host via `just run`), edit `alloy/config.alloy` to change `relay:3334` to `host.docker.internal:3334`, then:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.metrics.yml up alloy
+```
+
+**4. Collecting metrics from the performance test:**
+
+The integration perf test can expose a metrics HTTP server for Alloy to scrape during the run:
+
+```bash
+# Terminal 1: start Alloy
+docker compose -f docker-compose.yml -f docker-compose.metrics.yml up alloy
+
+# Terminal 2: run perf test with metrics server on :9090, hold open 90s after completion
+METRICS_PORT=9090 METRICS_WAIT=90s go test -v -tags=integration -run TestIntegration_QueryPerformance -timeout 30m ./zooid/
+```
+
+Alloy's `perftest` scrape target collects from `host.docker.internal:9090`.
+
 ### Prometheus scrape config
+
+If using Prometheus directly instead of Alloy:
 
 ```yaml
 scrape_configs:
