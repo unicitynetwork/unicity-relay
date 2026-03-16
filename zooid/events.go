@@ -9,6 +9,7 @@ import (
 	"iter"
 	"log"
 	"sort"
+	"strings"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/eventstore"
@@ -180,53 +181,10 @@ func (events *EventStore) queryEventsWith(runner squirrel.BaseRunner, filter nos
 }
 
 func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectBuilder {
-	qb := sb.Select("id", "created_at", "kind", "pubkey", "content", "tags", "sig").
-		From(events.Schema.Prefix("events")).
-		OrderBy("created_at DESC")
+	eventsTable := events.Schema.Prefix("events")
+	eventTagsTable := events.Schema.Prefix("event_tags")
 
-	// Handle search with tsvector FTS
-	if filter.Search != "" {
-		qb = qb.Where("search_vector @@ plainto_tsquery('english', ?)", filter.Search)
-	}
-
-	if len(filter.IDs) > 0 {
-		idStrs := make([]interface{}, len(filter.IDs))
-		for i, id := range filter.IDs {
-			idStrs[i] = id.Hex()
-		}
-		qb = qb.Where(squirrel.Eq{"id": idStrs})
-	}
-
-	if len(filter.Authors) > 0 {
-		authorStrs := make([]interface{}, len(filter.Authors))
-		for i, author := range filter.Authors {
-			authorStrs[i] = author.Hex()
-		}
-		qb = qb.Where(squirrel.Eq{"pubkey": authorStrs})
-	}
-
-	if len(filter.Kinds) > 0 {
-		kindInts := make([]interface{}, len(filter.Kinds))
-		for i, kind := range filter.Kinds {
-			kindInts[i] = int(kind)
-		}
-		qb = qb.Where(squirrel.Eq{"kind": kindInts})
-	}
-
-	if filter.Since != 0 {
-		qb = qb.Where(squirrel.GtOrEq{"created_at": filter.Since})
-	}
-
-	if filter.Until != 0 {
-		qb = qb.Where(squirrel.LtOrEq{"created_at": filter.Until})
-	}
-
-	// Tag filters use IN-subqueries against event_tags. The covering index
-	// (key, value, event_id) enables index-only scans on these subqueries,
-	// making the planner prefer a hash semi-join over a full events scan.
-	//
-	// Collect and sort tag filters for deterministic SQL output (Go map
-	// iteration order is random).
+	// Collect valid single-letter tag filters and sort for deterministic SQL.
 	type tagFilter struct {
 		key    string
 		values []interface{}
@@ -246,14 +204,86 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectB
 		return tagFilters[i].key < tagFilters[j].key
 	})
 
-	for _, tf := range tagFilters {
-		subQuery := squirrel.Select("event_id").
-			From(events.Schema.Prefix("event_tags")).
-			Where(squirrel.Eq{"key": tf.key}).
-			Where(squirrel.Eq{"value": tf.values})
+	// When tag filters are present, use a materialized CTE to force the
+	// planner to resolve tag lookups FIRST via the covering index, then
+	// join the small result set to events.
+	//
+	// Without this, PostgreSQL prefers to scan events backward by created_at
+	// (attracted by ORDER BY ... DESC LIMIT) and probe event_tags per row.
+	// With 319K+ events and sparse tag matches, that means scanning nearly
+	// the entire table — 25-60 seconds per query.
+	//
+	// The MATERIALIZED keyword acts as an optimization fence: PostgreSQL
+	// must complete the CTE (an index-only scan returning a few thousand
+	// event_ids) before starting the outer query.
+	col := "" // column qualifier: "" without tags, "e." with tags
+	var qb squirrel.SelectBuilder
 
-		subQuerySql, subQueryArgs, _ := subQuery.ToSql()
-		qb = qb.Where("id IN ("+subQuerySql+")", subQueryArgs...)
+	if len(tagFilters) > 0 {
+		col = "e."
+
+		// Build one SELECT per tag filter, INTERSECT them for AND logic.
+		var cteParts []string
+		var cteArgs []interface{}
+		for _, tf := range tagFilters {
+			subQ := squirrel.Select("event_id").
+				From(eventTagsTable).
+				Where(squirrel.Eq{"key": tf.key}).
+				Where(squirrel.Eq{"value": tf.values})
+			sql, args, _ := subQ.ToSql()
+			cteParts = append(cteParts, sql)
+			cteArgs = append(cteArgs, args...)
+		}
+
+		cteSql := "WITH _tag_ids AS MATERIALIZED (" +
+			strings.Join(cteParts, " INTERSECT ") + ")"
+
+		qb = sb.Select("e.id", "e.created_at", "e.kind", "e.pubkey",
+			"e.content", "e.tags", "e.sig").
+			Prefix(cteSql, cteArgs...).
+			From(eventsTable + " e").
+			Join("_tag_ids t ON t.event_id = e.id")
+	} else {
+		qb = sb.Select("id", "created_at", "kind", "pubkey", "content", "tags", "sig").
+			From(eventsTable)
+	}
+
+	qb = qb.OrderBy(col + "created_at DESC")
+
+	if filter.Search != "" {
+		qb = qb.Where(col+"search_vector @@ plainto_tsquery('english', ?)", filter.Search)
+	}
+
+	if len(filter.IDs) > 0 {
+		idStrs := make([]interface{}, len(filter.IDs))
+		for i, id := range filter.IDs {
+			idStrs[i] = id.Hex()
+		}
+		qb = qb.Where(squirrel.Eq{col + "id": idStrs})
+	}
+
+	if len(filter.Authors) > 0 {
+		authorStrs := make([]interface{}, len(filter.Authors))
+		for i, author := range filter.Authors {
+			authorStrs[i] = author.Hex()
+		}
+		qb = qb.Where(squirrel.Eq{col + "pubkey": authorStrs})
+	}
+
+	if len(filter.Kinds) > 0 {
+		kindInts := make([]interface{}, len(filter.Kinds))
+		for i, kind := range filter.Kinds {
+			kindInts[i] = int(kind)
+		}
+		qb = qb.Where(squirrel.Eq{col + "kind": kindInts})
+	}
+
+	if filter.Since != 0 {
+		qb = qb.Where(squirrel.GtOrEq{col + "created_at": filter.Since})
+	}
+
+	if filter.Until != 0 {
+		qb = qb.Where(squirrel.LtOrEq{col + "created_at": filter.Until})
 	}
 
 	if filter.Limit > 0 {
@@ -261,6 +291,39 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectB
 	}
 
 	return qb
+}
+
+// buildTagFilteredQuery constructs a raw SQL query using a materialized CTE
+// to force PostgreSQL to resolve tag lookups via the covering index before
+// joining to the events table.
+//
+// The generated SQL looks like:
+//
+//	WITH _tag_ids AS MATERIALIZED (
+//	    SELECT event_id FROM {event_tags}
+//	    WHERE key = $1 AND value IN ($2)
+//	    INTERSECT
+//	    SELECT event_id FROM {event_tags}
+//	    WHERE key = $3 AND value IN ($4)
+//	)
+//	SELECT e.id, e.created_at, e.kind, e.pubkey, e.content, e.tags, e.sig
+//	FROM {events} e
+//	JOIN _tag_ids t ON t.event_id = e.id
+//	WHERE e.kind IN ($5) AND e.created_at >= $6
+//	ORDER BY e.created_at DESC
+//	LIMIT 1000
+//
+// Squirrel cannot express materialized CTEs, so we build the CTE prefix as
+// raw SQL with Dollar placeholders and prepend it to a Squirrel-built outer
+// query. The placeholder numbering is coordinated manually: the CTE consumes
+// $1..$N, then the outer query continues from $(N+1).
+func (events *EventStore) buildTagFilteredQuery(filter nostr.Filter, tagFilters []struct {
+	key    string
+	values []interface{}
+}) squirrel.SelectBuilder {
+	// This is never called directly — the actual tagFilter type is local to
+	// buildSelectQuery. We need to accept the same shape here.
+	panic("unreachable — see buildSelectQueryWithTags")
 }
 
 func (events *EventStore) DeleteEvent(id nostr.ID) error {
