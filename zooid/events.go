@@ -15,6 +15,7 @@ import (
 	"fiatjaf.com/nostr/eventstore"
 	"fiatjaf.com/nostr/khatru"
 	"github.com/Masterminds/squirrel"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // Global Squirrel builder with Dollar placeholder format for PostgreSQL
@@ -108,7 +109,16 @@ func (events *EventStore) Close() {
 }
 
 func (events *EventStore) QueryEvents(filter nostr.Filter, maxLimit int) iter.Seq[nostr.Event] {
-	return events.queryEventsWith(GetDb(), filter, maxLimit)
+	return func(yield func(nostr.Event) bool) {
+		timer := prometheus.NewTimer(QueryDuration.With(prometheus.Labels{"instance": metricsInstance}))
+		defer timer.ObserveDuration()
+
+		for event := range events.queryEventsWith(GetDb(), filter, maxLimit) {
+			if !yield(event) {
+				return
+			}
+		}
+	}
 }
 
 func (events *EventStore) queryEventsWith(runner squirrel.BaseRunner, filter nostr.Filter, maxLimit int) iter.Seq[nostr.Event] {

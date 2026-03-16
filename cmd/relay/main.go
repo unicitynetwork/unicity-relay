@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"time"
 	"zooid/zooid"
+
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func main() {
@@ -19,10 +21,16 @@ func main() {
 	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
 
 	port := zooid.Env("PORT")
+	metricsHandler := promhttp.Handler()
 	srv := &http.Server{
 		Addr: fmt.Sprintf(":%s", port),
 		Handler: http.HandlerFunc(
 			func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/metrics" {
+					metricsHandler.ServeHTTP(w, r)
+					return
+				}
+
 				instance, exists := zooid.Dispatch(r.Host)
 				if exists {
 					instance.Relay.ServeHTTP(w, r)
@@ -41,6 +49,7 @@ func main() {
 	}()
 
 	go zooid.Start()
+	zooid.StartMetricsCollector()
 
 	<-shutdown
 
