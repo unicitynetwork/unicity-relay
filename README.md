@@ -265,7 +265,8 @@ All metrics carry an `instance` label derived from the relay's `schema` config v
 | `zooid_groups_hidden` | Gauge | Number of hidden groups |
 | `zooid_groups_closed` | Gauge | Number of closed groups |
 | `zooid_group_members` | Gauge | Members per group (labels: `instance`, `group`; capped at 1000 public groups) |
-| `zooid_group_members_total` | Gauge | Sum of all group members |
+| `zooid_group_messages` | Gauge | Chat messages per group (labels: `instance`, `group`; public groups only) |
+| `zooid_group_members_total` | Gauge | Distinct members across all groups |
 | `zooid_groups_tracked` | Gauge | Number of groups reported in per-group metrics |
 | `zooid_relay_members_total` | Gauge | Total relay members |
 | `zooid_banned_pubkeys_total` | Gauge | Total banned pubkeys |

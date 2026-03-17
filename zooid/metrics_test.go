@@ -148,9 +148,10 @@ func TestMetrics_CacheGauges(t *testing.T) {
 		t.Errorf("groupMembers[group-b] = %v, want 0 (private)", v)
 	}
 
-	// Total group members still counts ALL groups (including private)
-	if v := testutil.ToFloat64(groupMembersTotal.WithLabelValues(label)); v != 5 {
-		t.Errorf("groupMembersTotal = %v, want 5", v)
+	// Total group members counts distinct pubkeys across all groups (including private)
+	// pk1 in group-a+c, pk2 in group-a+b, pk3 in group-b → 3 distinct
+	if v := testutil.ToFloat64(groupMembersTotal.WithLabelValues(label)); v != 3 {
+		t.Errorf("groupMembersTotal = %v, want 3", v)
 	}
 
 	// Relay members
@@ -173,10 +174,17 @@ func TestMetrics_DBGauges(t *testing.T) {
 	inst := createMetricsTestInstance(t)
 	label := inst.Config.Schema
 
-	// Store some events: 2 chat messages (kind 9), 1 regular event
+	// Register groups in metadata cache: g1 public, g2 public, g3 private
+	inst.Groups.metadataCache.Store("g1", &groupMetaCache{found: true})
+	inst.Groups.metadataCache.Store("g2", &groupMetaCache{found: true})
+	inst.Groups.metadataCache.Store("g3", &groupMetaCache{found: true, private: true})
+
+	// Store events: 2 chat messages in g1, 1 in g2, 1 in g3 (private), 1 non-chat
 	for _, evt := range []nostr.Event{
 		{Kind: 9, CreatedAt: nostr.Now(), Tags: nostr.Tags{{"h", "g1"}}, Content: "hello"},
 		{Kind: 9, CreatedAt: nostr.Now(), Tags: nostr.Tags{{"h", "g1"}}, Content: "world"},
+		{Kind: 9, CreatedAt: nostr.Now(), Tags: nostr.Tags{{"h", "g2"}}, Content: "hi"},
+		{Kind: 9, CreatedAt: nostr.Now(), Tags: nostr.Tags{{"h", "g3"}}, Content: "secret"},
 		{Kind: 1, CreatedAt: nostr.Now(), Content: "note"},
 	} {
 		if err := inst.Events.SignAndStoreEvent(&evt, false); err != nil {
@@ -196,13 +204,24 @@ func TestMetrics_DBGauges(t *testing.T) {
 
 	// eventsTotal uses reltuples estimate — after ANALYZE it should be accurate
 	total := testutil.ToFloat64(eventsTotal.WithLabelValues(label))
-	if total < 3 {
-		t.Errorf("eventsTotal = %v, want >= 3", total)
+	if total < 5 {
+		t.Errorf("eventsTotal = %v, want >= 5", total)
 	}
 
-	// messagesTotal should be exactly 2 (the kind-9 events)
-	if v := testutil.ToFloat64(messagesTotal.WithLabelValues(label)); v != 2 {
-		t.Errorf("messagesTotal = %v, want 2", v)
+	// messagesTotal should be 4 (all kind-9 events including private group)
+	if v := testutil.ToFloat64(messagesTotal.WithLabelValues(label)); v != 4 {
+		t.Errorf("messagesTotal = %v, want 4", v)
+	}
+
+	// Per-group messages: g1=2, g2=1, g3 not reported (private)
+	if v := testutil.ToFloat64(groupMessages.WithLabelValues(label, "g1")); v != 2 {
+		t.Errorf("groupMessages[g1] = %v, want 2", v)
+	}
+	if v := testutil.ToFloat64(groupMessages.WithLabelValues(label, "g2")); v != 1 {
+		t.Errorf("groupMessages[g2] = %v, want 1", v)
+	}
+	if v := testutil.ToFloat64(groupMessages.WithLabelValues(label, "g3")); v != 0 {
+		t.Errorf("groupMessages[g3] = %v, want 0 (private)", v)
 	}
 }
 
@@ -229,10 +248,10 @@ func TestMetrics_GroupMembersCap(t *testing.T) {
 		t.Errorf("groupsTracked = %v, want 1000", tracked)
 	}
 
-	// groupMembersTotal should count all 1005 groups
+	// groupMembersTotal counts distinct pubkeys — all 1005 groups share the same pk
 	total := testutil.ToFloat64(groupMembersTotal.WithLabelValues(label))
-	if total != 1005 {
-		t.Errorf("groupMembersTotal = %v, want 1005", total)
+	if total != 1 {
+		t.Errorf("groupMembersTotal = %v, want 1", total)
 	}
 }
 
@@ -303,9 +322,9 @@ func TestMetrics_PrivateGroupsNotExposed(t *testing.T) {
 		t.Errorf("groupMembers[hidden-group] = %v, want 0", v)
 	}
 
-	// But total still includes all members
-	if v := testutil.ToFloat64(groupMembersTotal.WithLabelValues(label)); v != 3 {
-		t.Errorf("groupMembersTotal = %v, want 3", v)
+	// But total still includes all distinct members (same pk in all 3 groups)
+	if v := testutil.ToFloat64(groupMembersTotal.WithLabelValues(label)); v != 1 {
+		t.Errorf("groupMembersTotal = %v, want 1", v)
 	}
 
 	// Only 1 tracked (the public group)

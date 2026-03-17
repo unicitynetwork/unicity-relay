@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"fiatjaf.com/nostr"
+	"github.com/Masterminds/squirrel"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -41,9 +42,14 @@ var (
 		Help: "Number of members per group",
 	}, []string{"instance", "group"})
 
+	groupMessages = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "zooid_group_messages",
+		Help: "Number of chat messages per group",
+	}, []string{"instance", "group"})
+
 	groupMembersTotal = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "zooid_group_members_total",
-		Help: "Total members across all groups",
+		Help: "Distinct members across all groups (each pubkey counted once)",
 	}, []string{"instance"})
 
 	groupsTracked = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -90,6 +96,7 @@ func init() {
 		groupsHidden,
 		groupsClosed,
 		groupMembers,
+		groupMessages,
 		groupMembersTotal,
 		groupsTracked,
 		relayMembersTotal,
@@ -164,6 +171,7 @@ func collectMetrics() {
 			groupsHidden.DeletePartialMatch(match)
 			groupsClosed.DeletePartialMatch(match)
 			groupMembers.DeletePartialMatch(match)
+			groupMessages.DeletePartialMatch(match)
 			groupMembersTotal.DeletePartialMatch(match)
 			groupsTracked.DeletePartialMatch(match)
 			relayMembersTotal.DeletePartialMatch(match)
@@ -206,15 +214,16 @@ func collectCacheMetrics(inst *Instance) {
 	// Delete only this instance's stale per-group series.
 	groupMembers.DeletePartialMatch(prometheus.Labels{"instance": instLabel})
 
-	var totalMembers float64
+	distinctMembers := make(map[nostr.PubKey]struct{})
 	var tracked int
 	inst.Groups.membershipCache.Range(func(key, value any) bool {
 		ms := value.(*memberSet)
 		ms.mu.RLock()
 		count := float64(len(ms.members))
+		for pk := range ms.members {
+			distinctMembers[pk] = struct{}{}
+		}
 		ms.mu.RUnlock()
-
-		totalMembers += count
 
 		// Skip private/hidden groups to avoid leaking their IDs via /metrics
 		if tracked < maxTrackedGroups {
@@ -234,7 +243,7 @@ func collectCacheMetrics(inst *Instance) {
 		return true
 	})
 
-	groupMembersTotal.With(label).Set(totalMembers)
+	groupMembersTotal.With(label).Set(float64(len(distinctMembers)))
 	groupsTracked.With(label).Set(float64(tracked))
 
 	// Relay members
@@ -287,5 +296,72 @@ func collectDBMetrics(inst *Instance) {
 		log.Printf("metrics: failed to count messages: %v", err)
 	} else {
 		messagesTotal.With(label).Set(float64(msgCount))
+	}
+
+	// Per-group message counts — single grouped query, skip private/hidden.
+	groupMessages.DeletePartialMatch(prometheus.Labels{"instance": instLabel})
+	collectGroupMessageCounts(inst, instLabel)
+}
+
+func collectGroupMessageCounts(inst *Instance, instLabel string) {
+	// Collect visible group IDs (not private, not hidden), capped at maxTrackedGroups.
+	visibleGroups := make([]string, 0, maxTrackedGroups)
+	inst.Groups.metadataCache.Range(func(key, value any) bool {
+		if len(visibleGroups) >= maxTrackedGroups {
+			return false
+		}
+		meta := value.(*groupMetaCache)
+		if meta.private || meta.hidden {
+			return true
+		}
+		visibleGroups = append(visibleGroups, key.(string))
+		return true
+	})
+
+	if len(visibleGroups) == 0 {
+		return
+	}
+
+	// Build: SELECT t.value, COUNT(*) FROM {event_tags} t
+	//        JOIN {events} e ON e.id = t.event_id
+	//        WHERE t.key = 'h' AND t.value IN (...) AND e.kind IN (9, 10)
+	//        GROUP BY t.value
+	eventsTable := inst.Events.Schema.Prefix("events")
+	tagsTable := inst.Events.Schema.Prefix("event_tags")
+
+	kindArgs := make([]interface{}, len(chatKinds))
+	for i, k := range chatKinds {
+		kindArgs[i] = int(k)
+	}
+	groupArgs := make([]interface{}, len(visibleGroups))
+	for i, g := range visibleGroups {
+		groupArgs[i] = g
+	}
+
+	qb := sb.Select("t.value", "COUNT(*)").
+		From(tagsTable + " t").
+		Join(eventsTable + " e ON e.id = t.event_id").
+		Where(squirrel.Eq{"t.key": "h"}).
+		Where(squirrel.Eq{"t.value": groupArgs}).
+		Where(squirrel.Eq{"e.kind": kindArgs}).
+		GroupBy("t.value")
+
+	rows, err := qb.RunWith(GetDb()).Query()
+	if err != nil {
+		log.Printf("metrics: failed to query group message counts: %v", err)
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var group string
+		var count int64
+		if err := rows.Scan(&group, &count); err != nil {
+			continue
+		}
+		groupMessages.With(prometheus.Labels{
+			"instance": instLabel,
+			"group":    group,
+		}).Set(float64(count))
 	}
 }
