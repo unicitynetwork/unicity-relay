@@ -1,0 +1,29 @@
+// Scrape Zooid relay metrics (production use)
+prometheus.scrape "zooid" {
+  targets = [{
+    __address__ = "relay:3334",
+  }]
+  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+  scrape_interval = "15s"
+}
+
+// Scrape perf test metrics (host machine, enabled via METRICS_PORT=9090)
+prometheus.scrape "perftest" {
+  targets = [{
+    __address__ = "host.docker.internal:9090",
+  }]
+  forward_to      = [prometheus.remote_write.grafana_cloud.receiver]
+  scrape_interval = "15s"
+}
+
+// Forward to Grafana Cloud
+prometheus.remote_write "grafana_cloud" {
+  endpoint {
+    url = sys.env("GRAFANA_REMOTE_WRITE_URL")
+
+    basic_auth {
+      username = sys.env("GRAFANA_USERNAME")
+      password = sys.env("GRAFANA_API_TOKEN")
+    }
+  }
+}

@@ -5,12 +5,15 @@ package zooid
 import (
 	"encoding/hex"
 	"fmt"
+	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"fiatjaf.com/nostr"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // Scale parameters for the performance dataset.
@@ -209,6 +212,31 @@ func timeQuery(store *EventStore, filter nostr.Filter, cap int) (int, time.Durat
 // ---------- test ----------
 
 func TestIntegration_QueryPerformance(t *testing.T) {
+	// Start a metrics HTTP server so an external scraper (e.g. Grafana Alloy)
+	// can collect query duration histograms during the test run.
+	// Set METRICS_PORT to enable (e.g. METRICS_PORT=9090).
+	if port := os.Getenv("METRICS_PORT"); port != "" {
+		srv := &http.Server{
+			Addr:    ":" + port,
+			Handler: promhttp.Handler(),
+		}
+		srvErr := make(chan error, 1)
+		go func() {
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				srvErr <- err
+			}
+		}()
+		defer srv.Close()
+		// Give the server a moment to fail on bind errors
+		time.Sleep(50 * time.Millisecond)
+		select {
+		case err := <-srvErr:
+			t.Fatalf("Metrics server failed to start: %v", err)
+		default:
+		}
+		t.Logf("Metrics server listening on :%s", port)
+	}
+
 	store := seedPerfData(t)
 	eventsTable := store.Schema.Prefix("events")
 
@@ -449,5 +477,15 @@ func TestIntegration_QueryPerformance(t *testing.T) {
 			t.Errorf("Query too slow: %v (want < 2s)", dur)
 		}
 	})
+
+	// ── 10. Hold metrics server open for scraping ─────────────────────
+	if wait := os.Getenv("METRICS_WAIT"); wait != "" {
+		dur, err := time.ParseDuration(wait)
+		if err != nil {
+			dur = 2 * time.Minute
+		}
+		t.Logf("Holding metrics server open for %v (METRICS_WAIT=%s)", dur, wait)
+		time.Sleep(dur)
+	}
 }
 

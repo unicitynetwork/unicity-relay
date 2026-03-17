@@ -244,6 +244,89 @@ View logs:
 docker compose logs -f zooid
 ```
 
+## Metrics
+
+The relay exposes Prometheus metrics at the `/metrics` endpoint on the same port as the relay (default `3334`). No additional configuration is needed — metrics are always available.
+
+```bash
+curl http://localhost:3334/metrics
+```
+
+A background goroutine updates all metrics every 30 seconds. Cache-derived metrics (group counts, membership) are read from in-memory caches. `zooid_events_total` uses a Postgres `reltuples` estimate (instant, no table scan). `zooid_messages_total` uses an index-scanned COUNT query. Per-group member metrics exclude private and hidden groups.
+
+### Available metrics
+
+All metrics carry an `instance` label derived from the relay's `schema` config value.
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `zooid_groups_total` | Gauge | Total number of groups |
+| `zooid_groups_private` | Gauge | Number of private groups |
+| `zooid_groups_hidden` | Gauge | Number of hidden groups |
+| `zooid_groups_closed` | Gauge | Number of closed groups |
+| `zooid_group_members` | Gauge | Members per group (labels: `instance`, `group`; capped at 1000 public groups) |
+| `zooid_group_members_total` | Gauge | Sum of all group members |
+| `zooid_groups_tracked` | Gauge | Number of groups reported in per-group metrics |
+| `zooid_relay_members_total` | Gauge | Total relay members |
+| `zooid_banned_pubkeys_total` | Gauge | Total banned pubkeys |
+| `zooid_banned_events_total` | Gauge | Total banned events |
+| `zooid_events_total` | Gauge | Estimated total events in database (via `reltuples`) |
+| `zooid_messages_total` | Gauge | Total chat messages (kinds 9, 10) in database |
+| `zooid_query_duration_seconds` | Histogram | Duration of database query execution and row scanning |
+
+### Forwarding to Grafana Cloud with Alloy
+
+The repo includes a [Grafana Alloy](https://grafana.com/docs/alloy/) config that scrapes the relay and forwards metrics to Grafana Cloud via `remote_write`. The setup lives in `docker-compose.metrics.yml` and `alloy/config.alloy`.
+
+**1. Get your Grafana Cloud credentials** from your stack's Prometheus connection details (remote write URL, username, API token).
+
+**2. Start the relay and Alloy together:**
+
+```bash
+export RELAY_SECRET="$(openssl rand -hex 32)"
+export GRAFANA_REMOTE_WRITE_URL="https://prometheus-prod-XX-prod.grafana.net/api/prom/push"
+export GRAFANA_USERNAME="123456"
+export GRAFANA_API_TOKEN="glc_..."
+
+docker compose -f docker-compose.yml -f docker-compose.metrics.yml up --build
+```
+
+This starts postgres, builds/runs the relay, and starts Alloy — all on the same Docker network. Alloy scrapes `relay:3334/metrics` every 15 seconds.
+
+**3. To run Alloy standalone** (e.g. while running the relay on the host via `just run`), edit `alloy/config.alloy` to change `relay:3334` to `host.docker.internal:3334`, then:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.metrics.yml up alloy
+```
+
+**4. Collecting metrics from the performance test:**
+
+The integration perf test can expose a metrics HTTP server for Alloy to scrape during the run:
+
+```bash
+# Terminal 1: start Alloy
+docker compose -f docker-compose.yml -f docker-compose.metrics.yml up alloy
+
+# Terminal 2: run perf test with metrics server on :9090, hold open 90s after completion
+METRICS_PORT=9090 METRICS_WAIT=90s go test -v -tags=integration -run TestIntegration_QueryPerformance -timeout 30m ./zooid/
+```
+
+Alloy's `perftest` scrape target collects from `host.docker.internal:9090`.
+
+### Prometheus scrape config
+
+If using Prometheus directly instead of Alloy:
+
+```yaml
+scrape_configs:
+  - job_name: zooid
+    scrape_interval: 30s
+    static_configs:
+      - targets: ['localhost:3334']
+```
+
+If you don't configure a Prometheus scraper, the relay runs normally with negligible overhead — metrics are stored in fixed-size in-memory structs and overwritten each cycle.
+
 ## CI/CD
 
 ### GitHub Actions Workflows

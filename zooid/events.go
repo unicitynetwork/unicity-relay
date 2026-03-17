@@ -10,11 +10,13 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"time"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/eventstore"
 	"fiatjaf.com/nostr/khatru"
 	"github.com/Masterminds/squirrel"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 // Global Squirrel builder with Dollar placeholder format for PostgreSQL
@@ -121,8 +123,11 @@ func (events *EventStore) queryEventsWith(runner squirrel.BaseRunner, filter nos
 			filter.Limit = maxLimit
 		}
 
+		observer := QueryDuration.With(prometheus.Labels{"instance": events.Config.Schema})
+		queryStart := time.Now()
 		rows, err := events.buildSelectQuery(filter).RunWith(runner).Query()
 		if err != nil {
+			observer.Observe(time.Since(queryStart).Seconds())
 			log.Printf("QueryEvents query error: %v", err)
 			return
 		}
@@ -170,9 +175,12 @@ func (events *EventStore) queryEventsWith(runner squirrel.BaseRunner, filter nos
 			}
 
 			if !yield(evt) {
+				observer.Observe(time.Since(queryStart).Seconds())
 				return
 			}
 		}
+
+		observer.Observe(time.Since(queryStart).Seconds())
 
 		if err := rows.Err(); err != nil {
 			log.Printf("QueryEvents row iteration error: %v", err)
