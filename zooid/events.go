@@ -126,8 +126,8 @@ func (events *EventStore) queryEventsWith(runner squirrel.BaseRunner, filter nos
 		observer := QueryDuration.With(prometheus.Labels{"instance": events.Config.Schema})
 		queryStart := time.Now()
 		rows, err := events.buildSelectQuery(filter).RunWith(runner).Query()
-		observer.Observe(time.Since(queryStart).Seconds())
 		if err != nil {
+			observer.Observe(time.Since(queryStart).Seconds())
 			log.Printf("QueryEvents query error: %v", err)
 			return
 		}
@@ -175,9 +175,12 @@ func (events *EventStore) queryEventsWith(runner squirrel.BaseRunner, filter nos
 			}
 
 			if !yield(evt) {
+				observer.Observe(time.Since(queryStart).Seconds())
 				return
 			}
 		}
+
+		observer.Observe(time.Since(queryStart).Seconds())
 
 		if err := rows.Err(); err != nil {
 			log.Printf("QueryEvents row iteration error: %v", err)

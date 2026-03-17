@@ -108,9 +108,10 @@ func TestMetrics_CacheGauges(t *testing.T) {
 	// Populate banned pubkeys
 	inst.Management.bannedPubkeys.Store(nostr.Generate().Public(), "spam")
 
-	// Populate banned events
-	fakeID := nostr.Generate().Public()
-	inst.Management.bannedEvents.Store(fakeID, "abuse")
+	// Populate banned events (key must be nostr.ID, not nostr.PubKey)
+	fakeEvt := nostr.Event{Kind: 1, CreatedAt: nostr.Now(), Content: "x"}
+	fakeEvt.Sign(nostr.Generate())
+	inst.Management.bannedEvents.Store(fakeEvt.ID, "abuse")
 
 	withTestInstance(t, inst, func() {
 		collectMetrics()

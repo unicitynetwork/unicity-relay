@@ -36,17 +36,16 @@ func Start() {
 		log.Fatalf("Failed to create config directory: %v", err)
 	}
 
-	instancesOnce.Do(func() {
-		instancesByHost = make(map[string]*Instance)
-		instancesByName = make(map[string]*Instance)
-	})
-
 	entries, err := os.ReadDir(configDir)
 	if err != nil {
 		log.Fatalf("Failed to scan config directory: %v", err)
 	}
 
 	instancesMux.Lock()
+	instancesOnce.Do(func() {
+		instancesByHost = make(map[string]*Instance)
+		instancesByName = make(map[string]*Instance)
+	})
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue

@@ -252,11 +252,11 @@ The relay exposes Prometheus metrics at the `/metrics` endpoint on the same port
 curl http://localhost:3334/metrics
 ```
 
-A background goroutine updates all metrics every 30 seconds. Cache-derived metrics (group counts, membership) are read from in-memory caches. DB-derived metrics (event/message totals) run lightweight COUNT queries.
+A background goroutine updates all metrics every 30 seconds. Cache-derived metrics (group counts, membership) are read from in-memory caches. `zooid_events_total` uses a Postgres `reltuples` estimate (instant, no table scan). `zooid_messages_total` uses an index-scanned COUNT query. Per-group member metrics exclude private and hidden groups.
 
 ### Available metrics
 
-All metrics carry an `instance` label (hardcoded to `g-relay` for the groupchat relay).
+All metrics carry an `instance` label derived from the relay's `schema` config value.
 
 | Metric | Type | Description |
 |--------|------|-------------|
@@ -264,15 +264,15 @@ All metrics carry an `instance` label (hardcoded to `g-relay` for the groupchat 
 | `zooid_groups_private` | Gauge | Number of private groups |
 | `zooid_groups_hidden` | Gauge | Number of hidden groups |
 | `zooid_groups_closed` | Gauge | Number of closed groups |
-| `zooid_group_members` | Gauge | Members per group (labels: `instance`, `group`; capped at 1000 groups) |
+| `zooid_group_members` | Gauge | Members per group (labels: `instance`, `group`; capped at 1000 public groups) |
 | `zooid_group_members_total` | Gauge | Sum of all group members |
 | `zooid_groups_tracked` | Gauge | Number of groups reported in per-group metrics |
 | `zooid_relay_members_total` | Gauge | Total relay members |
 | `zooid_banned_pubkeys_total` | Gauge | Total banned pubkeys |
 | `zooid_banned_events_total` | Gauge | Total banned events |
-| `zooid_events_total` | Gauge | Total events in database |
+| `zooid_events_total` | Gauge | Estimated total events in database (via `reltuples`) |
 | `zooid_messages_total` | Gauge | Total chat messages (kinds 9, 10) in database |
-| `zooid_query_duration_seconds` | Histogram | Duration of database queries |
+| `zooid_query_duration_seconds` | Histogram | Duration of database query execution and row scanning |
 
 ### Forwarding to Grafana Cloud with Alloy
 

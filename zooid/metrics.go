@@ -73,7 +73,7 @@ var (
 
 	messagesTotal = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "zooid_messages_total",
-		Help: "Estimated total chat messages in database",
+		Help: "Total chat messages in database",
 	}, []string{"instance"})
 
 	QueryDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -124,6 +124,10 @@ const maxTrackedGroups = 1000
 // Prometheus metrics every 30 seconds.
 func StartMetricsCollector() {
 	go func() {
+		// Initial collection — may return empty if instances haven't loaded yet,
+		// but avoids serving zeros for the first 30 seconds once they have.
+		collectMetrics()
+
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 
