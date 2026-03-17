@@ -3,11 +3,14 @@ package zooid
 import (
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"fiatjaf.com/nostr"
 	"github.com/prometheus/client_golang/prometheus"
 )
+
+var collectMu sync.Mutex
 
 // Chat message kinds for the messages_total metric (NIP-29 group chat)
 var chatKinds = []nostr.Kind{9, 10}
@@ -131,6 +134,9 @@ func StartMetricsCollector() {
 }
 
 func collectMetrics() {
+	collectMu.Lock()
+	defer collectMu.Unlock()
+
 	instances := GetAllInstances()
 
 	for _, inst := range instances {
@@ -230,10 +236,11 @@ func collectDBMetrics(inst *Instance) {
 	eventsTable := inst.Events.Schema.Prefix("events")
 
 	// Use Postgres reltuples estimate — no sequential scan, instant.
-	// PostgreSQL lowercases unquoted identifiers, so match against lowercase.
+	// GREATEST handles -1 (never-analyzed tables). PostgreSQL lowercases
+	// unquoted identifiers, so match against lowercase.
 	var eventsEst float64
 	err := GetDb().QueryRow(
-		"SELECT COALESCE(reltuples, 0) FROM pg_class WHERE relname = $1",
+		"SELECT GREATEST(COALESCE(reltuples, 0), 0) FROM pg_class WHERE relname = $1",
 		strings.ToLower(eventsTable),
 	).Scan(&eventsEst)
 	if err != nil {

@@ -46,6 +46,7 @@ func Start() {
 		log.Fatalf("Failed to scan config directory: %v", err)
 	}
 
+	instancesMux.Lock()
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -61,6 +62,7 @@ func Start() {
 			log.Printf("Loaded %s", entry.Name())
 		}
 	}
+	instancesMux.Unlock()
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
