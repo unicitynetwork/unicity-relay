@@ -2,13 +2,12 @@ package zooid
 
 import (
 	"log"
+	"strings"
 	"time"
 
 	"fiatjaf.com/nostr"
 	"github.com/prometheus/client_golang/prometheus"
 )
-
-const metricsInstance = "g-relay"
 
 // Chat message kinds for the messages_total metric (NIP-29 group chat)
 var chatKinds = []nostr.Kind{9, 10}
@@ -66,17 +65,17 @@ var (
 
 	eventsTotal = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "zooid_events_total",
-		Help: "Total events in database",
+		Help: "Estimated total events in database",
 	}, []string{"instance"})
 
 	messagesTotal = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "zooid_messages_total",
-		Help: "Total chat messages in database",
+		Help: "Estimated total chat messages in database",
 	}, []string{"instance"})
 
 	QueryDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "zooid_query_duration_seconds",
-		Help:    "Duration of database queries",
+		Help:    "Duration of database queries (DB execution and row scanning)",
 		Buckets: prometheus.DefBuckets,
 	}, []string{"instance"})
 )
@@ -111,6 +110,11 @@ func GetAllInstances() []*Instance {
 	return result
 }
 
+// instanceLabel returns the instance label value for metrics, derived from config.
+func instanceLabel(inst *Instance) string {
+	return inst.Config.Schema
+}
+
 const maxTrackedGroups = 1000
 
 // StartMetricsCollector launches a background goroutine that updates
@@ -119,9 +123,6 @@ func StartMetricsCollector() {
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
-
-		// Collect once immediately at startup
-		collectMetrics()
 
 		for range ticker.C {
 			collectMetrics()
@@ -139,7 +140,8 @@ func collectMetrics() {
 }
 
 func collectCacheMetrics(inst *Instance) {
-	label := prometheus.Labels{"instance": metricsInstance}
+	instLabel := instanceLabel(inst)
+	label := prometheus.Labels{"instance": instLabel}
 
 	// Group counts from metadataCache
 	var total, private, hidden, closed float64
@@ -162,9 +164,9 @@ func collectCacheMetrics(inst *Instance) {
 	groupsHidden.With(label).Set(hidden)
 	groupsClosed.With(label).Set(closed)
 
-	// Per-group member counts from membershipCache
-	// Reset per-group gauges to avoid stale entries from deleted groups
-	groupMembers.Reset()
+	// Per-group member counts from membershipCache.
+	// Delete only this instance's stale per-group series.
+	groupMembers.DeletePartialMatch(prometheus.Labels{"instance": instLabel})
 
 	var totalMembers float64
 	var tracked int
@@ -176,10 +178,17 @@ func collectCacheMetrics(inst *Instance) {
 
 		totalMembers += count
 
+		// Skip private/hidden groups to avoid leaking their IDs via /metrics
 		if tracked < maxTrackedGroups {
 			h := key.(string)
+			if v, ok := inst.Groups.metadataCache.Load(h); ok {
+				meta := v.(*groupMetaCache)
+				if meta.private || meta.hidden {
+					return true
+				}
+			}
 			groupMembers.With(prometheus.Labels{
-				"instance": metricsInstance,
+				"instance": instLabel,
 				"group":    h,
 			}).Set(count)
 			tracked++
@@ -216,17 +225,24 @@ func collectCacheMetrics(inst *Instance) {
 }
 
 func collectDBMetrics(inst *Instance) {
-	label := prometheus.Labels{"instance": metricsInstance}
+	instLabel := instanceLabel(inst)
+	label := prometheus.Labels{"instance": instLabel}
+	eventsTable := inst.Events.Schema.Prefix("events")
 
-	// Total events
-	count, err := inst.Events.CountEvents(nostr.Filter{})
+	// Use Postgres reltuples estimate — no sequential scan, instant.
+	// PostgreSQL lowercases unquoted identifiers, so match against lowercase.
+	var eventsEst float64
+	err := GetDb().QueryRow(
+		"SELECT COALESCE(reltuples, 0) FROM pg_class WHERE relname = $1",
+		strings.ToLower(eventsTable),
+	).Scan(&eventsEst)
 	if err != nil {
-		log.Printf("metrics: failed to count events: %v", err)
+		log.Printf("metrics: failed to estimate events: %v", err)
 	} else {
-		eventsTotal.With(label).Set(float64(count))
+		eventsTotal.With(label).Set(eventsEst)
 	}
 
-	// Total chat messages
+	// Chat message count — use COUNT with kind filter (hits the kind index).
 	msgCount, err := inst.Events.CountEvents(nostr.Filter{Kinds: chatKinds})
 	if err != nil {
 		log.Printf("metrics: failed to count messages: %v", err)

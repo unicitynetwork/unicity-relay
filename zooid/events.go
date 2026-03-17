@@ -10,6 +10,7 @@ import (
 	"log"
 	"sort"
 	"strings"
+	"time"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/eventstore"
@@ -109,16 +110,7 @@ func (events *EventStore) Close() {
 }
 
 func (events *EventStore) QueryEvents(filter nostr.Filter, maxLimit int) iter.Seq[nostr.Event] {
-	return func(yield func(nostr.Event) bool) {
-		timer := prometheus.NewTimer(QueryDuration.With(prometheus.Labels{"instance": metricsInstance}))
-		defer timer.ObserveDuration()
-
-		for event := range events.queryEventsWith(GetDb(), filter, maxLimit) {
-			if !yield(event) {
-				return
-			}
-		}
-	}
+	return events.queryEventsWith(GetDb(), filter, maxLimit)
 }
 
 func (events *EventStore) queryEventsWith(runner squirrel.BaseRunner, filter nostr.Filter, maxLimit int) iter.Seq[nostr.Event] {
@@ -131,7 +123,10 @@ func (events *EventStore) queryEventsWith(runner squirrel.BaseRunner, filter nos
 			filter.Limit = maxLimit
 		}
 
+		observer := QueryDuration.With(prometheus.Labels{"instance": events.Config.Schema})
+		queryStart := time.Now()
 		rows, err := events.buildSelectQuery(filter).RunWith(runner).Query()
+		observer.Observe(time.Since(queryStart).Seconds())
 		if err != nil {
 			log.Printf("QueryEvents query error: %v", err)
 			return

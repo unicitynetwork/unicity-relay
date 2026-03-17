@@ -220,7 +220,11 @@ func TestIntegration_QueryPerformance(t *testing.T) {
 			Addr:    ":" + port,
 			Handler: promhttp.Handler(),
 		}
-		go srv.ListenAndServe()
+		go func() {
+			if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				t.Errorf("Metrics server failed: %v", err)
+			}
+		}()
 		defer srv.Close()
 		t.Logf("Metrics server listening on :%s", port)
 	}

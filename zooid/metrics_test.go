@@ -1,6 +1,7 @@
 package zooid
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 
@@ -12,10 +13,11 @@ import (
 func createMetricsTestInstance() *Instance {
 	config := &Config{
 		Host:   "test.com",
+		Schema: "test_metrics_" + RandomString(8),
 		secret: nostr.Generate(),
 	}
 	config.Groups.Enabled = true
-	schema := &Schema{Name: "test_" + RandomString(8)}
+	schema := &Schema{Name: config.Schema}
 	relay := khatru.NewRelay()
 	events := &EventStore{
 		Relay:  relay,
@@ -44,10 +46,29 @@ func createMetricsTestInstance() *Instance {
 	}
 }
 
+func withTestInstance(t *testing.T, inst *Instance, fn func()) {
+	t.Helper()
+	instancesMux.Lock()
+	oldByName := instancesByName
+	oldByHost := instancesByHost
+	instancesByName = map[string]*Instance{"test": inst}
+	instancesByHost = map[string]*Instance{"test.com": inst}
+	instancesMux.Unlock()
+	defer func() {
+		instancesMux.Lock()
+		instancesByName = oldByName
+		instancesByHost = oldByHost
+		instancesMux.Unlock()
+	}()
+	fn()
+}
+
 func TestMetrics_CacheGauges(t *testing.T) {
 	inst := createMetricsTestInstance()
+	label := inst.Config.Schema
 
-	// Populate group metadata cache: 3 groups, 2 private, 1 hidden, 1 closed
+	// Populate group metadata cache: 3 groups — 2 private, 1 hidden, 1 closed
+	// group-a: private+hidden, group-b: private+closed, group-c: public
 	inst.Groups.metadataCache.Store("group-a", &groupMetaCache{
 		found:   true,
 		private: true,
@@ -74,8 +95,10 @@ func TestMetrics_CacheGauges(t *testing.T) {
 
 	msA := &memberSet{members: map[nostr.PubKey]struct{}{pk1: {}, pk2: {}}}
 	msB := &memberSet{members: map[nostr.PubKey]struct{}{pk2: {}, pk3: {}}}
+	msC := &memberSet{members: map[nostr.PubKey]struct{}{pk1: {}}}
 	inst.Groups.membershipCache.Store("group-a", msA)
 	inst.Groups.membershipCache.Store("group-b", msB)
+	inst.Groups.membershipCache.Store("group-c", msC)
 
 	// Populate relay members
 	inst.Management.relayMembers.Store(pk1, struct{}{})
@@ -86,70 +109,65 @@ func TestMetrics_CacheGauges(t *testing.T) {
 	inst.Management.bannedPubkeys.Store(nostr.Generate().Public(), "spam")
 
 	// Populate banned events
-	fakeID := nostr.Generate().Public() // just need a value for the sync.Map
+	fakeID := nostr.Generate().Public()
 	inst.Management.bannedEvents.Store(fakeID, "abuse")
 
-	// Wire up instance maps so GetAllInstances finds it
-	instancesMux.Lock()
-	oldByName := instancesByName
-	oldByHost := instancesByHost
-	instancesByName = map[string]*Instance{"test": inst}
-	instancesByHost = map[string]*Instance{"test.com": inst}
-	instancesMux.Unlock()
-	defer func() {
-		instancesMux.Lock()
-		instancesByName = oldByName
-		instancesByHost = oldByHost
-		instancesMux.Unlock()
-	}()
-
-	collectMetrics()
+	withTestInstance(t, inst, func() {
+		collectMetrics()
+	})
 
 	// Group counts
-	if v := testutil.ToFloat64(groupsTotal.WithLabelValues(metricsInstance)); v != 3 {
+	if v := testutil.ToFloat64(groupsTotal.WithLabelValues(label)); v != 3 {
 		t.Errorf("groupsTotal = %v, want 3", v)
 	}
-	if v := testutil.ToFloat64(groupsPrivate.WithLabelValues(metricsInstance)); v != 2 {
+	if v := testutil.ToFloat64(groupsPrivate.WithLabelValues(label)); v != 2 {
 		t.Errorf("groupsPrivate = %v, want 2", v)
 	}
-	if v := testutil.ToFloat64(groupsHidden.WithLabelValues(metricsInstance)); v != 1 {
+	if v := testutil.ToFloat64(groupsHidden.WithLabelValues(label)); v != 1 {
 		t.Errorf("groupsHidden = %v, want 1", v)
 	}
-	if v := testutil.ToFloat64(groupsClosed.WithLabelValues(metricsInstance)); v != 1 {
+	if v := testutil.ToFloat64(groupsClosed.WithLabelValues(label)); v != 1 {
 		t.Errorf("groupsClosed = %v, want 1", v)
 	}
 
-	// Per-group members
-	if v := testutil.ToFloat64(groupMembers.WithLabelValues(metricsInstance, "group-a")); v != 2 {
-		t.Errorf("groupMembers[group-a] = %v, want 2", v)
-	}
-	if v := testutil.ToFloat64(groupMembers.WithLabelValues(metricsInstance, "group-b")); v != 2 {
-		t.Errorf("groupMembers[group-b] = %v, want 2", v)
+	// Per-group members: only group-c should be reported (group-a is private+hidden, group-b is private)
+	if v := testutil.ToFloat64(groupMembers.WithLabelValues(label, "group-c")); v != 1 {
+		t.Errorf("groupMembers[group-c] = %v, want 1", v)
 	}
 
-	// Total group members
-	if v := testutil.ToFloat64(groupMembersTotal.WithLabelValues(metricsInstance)); v != 4 {
-		t.Errorf("groupMembersTotal = %v, want 4", v)
+	// Private/hidden groups should NOT have per-group metrics
+	// (WithLabelValues creates the series with 0, so we check it stays 0)
+	if v := testutil.ToFloat64(groupMembers.WithLabelValues(label, "group-a")); v != 0 {
+		t.Errorf("groupMembers[group-a] = %v, want 0 (private+hidden)", v)
+	}
+	if v := testutil.ToFloat64(groupMembers.WithLabelValues(label, "group-b")); v != 0 {
+		t.Errorf("groupMembers[group-b] = %v, want 0 (private)", v)
+	}
+
+	// Total group members still counts ALL groups (including private)
+	if v := testutil.ToFloat64(groupMembersTotal.WithLabelValues(label)); v != 5 {
+		t.Errorf("groupMembersTotal = %v, want 5", v)
 	}
 
 	// Relay members
-	if v := testutil.ToFloat64(relayMembersTotal.WithLabelValues(metricsInstance)); v != 3 {
+	if v := testutil.ToFloat64(relayMembersTotal.WithLabelValues(label)); v != 3 {
 		t.Errorf("relayMembersTotal = %v, want 3", v)
 	}
 
 	// Banned pubkeys
-	if v := testutil.ToFloat64(bannedPubkeysTotal.WithLabelValues(metricsInstance)); v != 1 {
+	if v := testutil.ToFloat64(bannedPubkeysTotal.WithLabelValues(label)); v != 1 {
 		t.Errorf("bannedPubkeysTotal = %v, want 1", v)
 	}
 
 	// Banned events
-	if v := testutil.ToFloat64(bannedEventsTotal.WithLabelValues(metricsInstance)); v != 1 {
+	if v := testutil.ToFloat64(bannedEventsTotal.WithLabelValues(label)); v != 1 {
 		t.Errorf("bannedEventsTotal = %v, want 1", v)
 	}
 }
 
 func TestMetrics_DBGauges(t *testing.T) {
 	inst := createMetricsTestInstance()
+	label := inst.Config.Schema
 
 	// Store some events: 2 chat messages (kind 9), 1 regular event
 	for _, evt := range []nostr.Event{
@@ -160,37 +178,31 @@ func TestMetrics_DBGauges(t *testing.T) {
 		inst.Events.SignAndStoreEvent(&evt, false)
 	}
 
-	instancesMux.Lock()
-	oldByName := instancesByName
-	oldByHost := instancesByHost
-	instancesByName = map[string]*Instance{"test": inst}
-	instancesByHost = map[string]*Instance{"test.com": inst}
-	instancesMux.Unlock()
-	defer func() {
-		instancesMux.Lock()
-		instancesByName = oldByName
-		instancesByHost = oldByHost
-		instancesMux.Unlock()
-	}()
+	// ANALYZE to update reltuples
+	eventsTable := inst.Events.Schema.Prefix("events")
+	GetDb().Exec(fmt.Sprintf("ANALYZE %s", eventsTable))
 
-	collectMetrics()
+	withTestInstance(t, inst, func() {
+		collectMetrics()
+	})
 
-	// eventsTotal includes the events we stored plus any internal events from Init
-	total := testutil.ToFloat64(eventsTotal.WithLabelValues(metricsInstance))
+	// eventsTotal uses reltuples estimate — after ANALYZE it should be accurate
+	total := testutil.ToFloat64(eventsTotal.WithLabelValues(label))
 	if total < 3 {
 		t.Errorf("eventsTotal = %v, want >= 3", total)
 	}
 
 	// messagesTotal should be exactly 2 (the kind-9 events)
-	if v := testutil.ToFloat64(messagesTotal.WithLabelValues(metricsInstance)); v != 2 {
+	if v := testutil.ToFloat64(messagesTotal.WithLabelValues(label)); v != 2 {
 		t.Errorf("messagesTotal = %v, want 2", v)
 	}
 }
 
 func TestMetrics_GroupMembersCap(t *testing.T) {
 	inst := createMetricsTestInstance()
+	label := inst.Config.Schema
 
-	// Create 1005 groups with 1 member each
+	// Create 1005 public groups with 1 member each
 	pk := nostr.Generate().Public()
 	for i := 0; i < 1005; i++ {
 		h := RandomString(10)
@@ -199,29 +211,18 @@ func TestMetrics_GroupMembersCap(t *testing.T) {
 		inst.Groups.membershipCache.Store(h, ms)
 	}
 
-	instancesMux.Lock()
-	oldByName := instancesByName
-	oldByHost := instancesByHost
-	instancesByName = map[string]*Instance{"test": inst}
-	instancesByHost = map[string]*Instance{"test.com": inst}
-	instancesMux.Unlock()
-	defer func() {
-		instancesMux.Lock()
-		instancesByName = oldByName
-		instancesByHost = oldByHost
-		instancesMux.Unlock()
-	}()
-
-	collectMetrics()
+	withTestInstance(t, inst, func() {
+		collectMetrics()
+	})
 
 	// groupsTracked should be capped at 1000
-	tracked := testutil.ToFloat64(groupsTracked.WithLabelValues(metricsInstance))
+	tracked := testutil.ToFloat64(groupsTracked.WithLabelValues(label))
 	if tracked != 1000 {
 		t.Errorf("groupsTracked = %v, want 1000", tracked)
 	}
 
 	// groupMembersTotal should count all 1005 groups
-	total := testutil.ToFloat64(groupMembersTotal.WithLabelValues(metricsInstance))
+	total := testutil.ToFloat64(groupMembersTotal.WithLabelValues(label))
 	if total != 1005 {
 		t.Errorf("groupMembersTotal = %v, want 1005", total)
 	}
@@ -229,38 +230,79 @@ func TestMetrics_GroupMembersCap(t *testing.T) {
 
 func TestMetrics_StaleGroupsCleared(t *testing.T) {
 	inst := createMetricsTestInstance()
+	label := inst.Config.Schema
 
-	// First collection: group exists
+	// First collection: group exists (public, so it gets per-group metric)
+	inst.Groups.metadataCache.Store("old-group", &groupMetaCache{found: true})
 	inst.Groups.membershipCache.Store("old-group", &memberSet{
 		members: map[nostr.PubKey]struct{}{nostr.Generate().Public(): {}},
 	})
 
-	instancesMux.Lock()
-	oldByName := instancesByName
-	oldByHost := instancesByHost
-	instancesByName = map[string]*Instance{"test": inst}
-	instancesByHost = map[string]*Instance{"test.com": inst}
-	instancesMux.Unlock()
-	defer func() {
-		instancesMux.Lock()
-		instancesByName = oldByName
-		instancesByHost = oldByHost
-		instancesMux.Unlock()
-	}()
+	withTestInstance(t, inst, func() {
+		collectMetrics()
+	})
 
-	collectMetrics()
-
-	if v := testutil.ToFloat64(groupMembers.WithLabelValues(metricsInstance, "old-group")); v != 1 {
+	if v := testutil.ToFloat64(groupMembers.WithLabelValues(label, "old-group")); v != 1 {
 		t.Errorf("groupMembers[old-group] = %v, want 1", v)
 	}
 
 	// Delete the group from cache, re-collect
 	inst.Groups.membershipCache.Delete("old-group")
-	collectMetrics()
+	inst.Groups.metadataCache.Delete("old-group")
+	withTestInstance(t, inst, func() {
+		collectMetrics()
+	})
 
-	// After reset, the stale gauge should be 0
-	if v := testutil.ToFloat64(groupMembers.WithLabelValues(metricsInstance, "old-group")); v != 0 {
+	// After DeletePartialMatch, the stale gauge should be 0
+	if v := testutil.ToFloat64(groupMembers.WithLabelValues(label, "old-group")); v != 0 {
 		t.Errorf("groupMembers[old-group] after delete = %v, want 0", v)
+	}
+}
+
+func TestMetrics_PrivateGroupsNotExposed(t *testing.T) {
+	inst := createMetricsTestInstance()
+	label := inst.Config.Schema
+
+	pk := nostr.Generate().Public()
+
+	inst.Groups.metadataCache.Store("secret-group", &groupMetaCache{found: true, private: true})
+	inst.Groups.membershipCache.Store("secret-group", &memberSet{
+		members: map[nostr.PubKey]struct{}{pk: {}},
+	})
+	inst.Groups.metadataCache.Store("hidden-group", &groupMetaCache{found: true, hidden: true})
+	inst.Groups.membershipCache.Store("hidden-group", &memberSet{
+		members: map[nostr.PubKey]struct{}{pk: {}},
+	})
+	inst.Groups.metadataCache.Store("public-group", &groupMetaCache{found: true})
+	inst.Groups.membershipCache.Store("public-group", &memberSet{
+		members: map[nostr.PubKey]struct{}{pk: {}},
+	})
+
+	withTestInstance(t, inst, func() {
+		collectMetrics()
+	})
+
+	// Public group should be tracked
+	if v := testutil.ToFloat64(groupMembers.WithLabelValues(label, "public-group")); v != 1 {
+		t.Errorf("groupMembers[public-group] = %v, want 1", v)
+	}
+
+	// Private and hidden groups should NOT have per-group metrics
+	if v := testutil.ToFloat64(groupMembers.WithLabelValues(label, "secret-group")); v != 0 {
+		t.Errorf("groupMembers[secret-group] = %v, want 0", v)
+	}
+	if v := testutil.ToFloat64(groupMembers.WithLabelValues(label, "hidden-group")); v != 0 {
+		t.Errorf("groupMembers[hidden-group] = %v, want 0", v)
+	}
+
+	// But total still includes all members
+	if v := testutil.ToFloat64(groupMembersTotal.WithLabelValues(label)); v != 3 {
+		t.Errorf("groupMembersTotal = %v, want 3", v)
+	}
+
+	// Only 1 tracked (the public group)
+	if v := testutil.ToFloat64(groupsTracked.WithLabelValues(label)); v != 1 {
+		t.Errorf("groupsTracked = %v, want 1", v)
 	}
 }
 
@@ -284,17 +326,44 @@ func TestMetrics_QueryDurationHistogram(t *testing.T) {
 func TestMetrics_ConcurrentCollect(t *testing.T) {
 	inst := createMetricsTestInstance()
 
-	inst.Groups.metadataCache.Store("g1", &groupMetaCache{found: true, private: true})
+	inst.Groups.metadataCache.Store("g1", &groupMetaCache{found: true})
 	inst.Groups.membershipCache.Store("g1", &memberSet{
 		members: map[nostr.PubKey]struct{}{nostr.Generate().Public(): {}},
 	})
 	inst.Management.relayMembers.Store(nostr.Generate().Public(), struct{}{})
 
+	withTestInstance(t, inst, func() {
+		// Run multiple collections concurrently — should not panic or race
+		var wg sync.WaitGroup
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				collectMetrics()
+			}()
+		}
+		wg.Wait()
+	})
+}
+
+func TestMetrics_MultipleInstances(t *testing.T) {
+	inst1 := createMetricsTestInstance()
+	inst2 := createMetricsTestInstance()
+
+	// Different schemas = different instance labels
+	if inst1.Config.Schema == inst2.Config.Schema {
+		t.Fatal("test instances should have different schemas")
+	}
+
+	inst1.Groups.metadataCache.Store("g1", &groupMetaCache{found: true})
+	inst2.Groups.metadataCache.Store("g2", &groupMetaCache{found: true})
+	inst2.Groups.metadataCache.Store("g3", &groupMetaCache{found: true})
+
 	instancesMux.Lock()
 	oldByName := instancesByName
 	oldByHost := instancesByHost
-	instancesByName = map[string]*Instance{"test": inst}
-	instancesByHost = map[string]*Instance{"test.com": inst}
+	instancesByName = map[string]*Instance{"inst1": inst1, "inst2": inst2}
+	instancesByHost = map[string]*Instance{inst1.Config.Host: inst1, inst2.Config.Host: inst2}
 	instancesMux.Unlock()
 	defer func() {
 		instancesMux.Lock()
@@ -303,14 +372,13 @@ func TestMetrics_ConcurrentCollect(t *testing.T) {
 		instancesMux.Unlock()
 	}()
 
-	// Run multiple collections concurrently — should not panic or race
-	var wg sync.WaitGroup
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			collectMetrics()
-		}()
+	collectMetrics()
+
+	// Each instance should have its own metric
+	if v := testutil.ToFloat64(groupsTotal.WithLabelValues(inst1.Config.Schema)); v != 1 {
+		t.Errorf("inst1 groupsTotal = %v, want 1", v)
 	}
-	wg.Wait()
+	if v := testutil.ToFloat64(groupsTotal.WithLabelValues(inst2.Config.Schema)); v != 2 {
+		t.Errorf("inst2 groupsTotal = %v, want 2", v)
+	}
 }
