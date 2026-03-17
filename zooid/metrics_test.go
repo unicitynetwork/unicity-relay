@@ -10,7 +10,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
-func createMetricsTestInstance() *Instance {
+func createMetricsTestInstance(t *testing.T) *Instance {
+	t.Helper()
 	config := &Config{
 		Host:   "test.com",
 		Schema: "test_metrics_" + RandomString(8),
@@ -24,7 +25,9 @@ func createMetricsTestInstance() *Instance {
 		Config: config,
 		Schema: schema,
 	}
-	events.Init()
+	if err := events.Init(); err != nil {
+		t.Fatalf("events.Init failed: %v", err)
+	}
 
 	mgmt := &ManagementStore{
 		Config: config,
@@ -64,7 +67,7 @@ func withTestInstance(t *testing.T, inst *Instance, fn func()) {
 }
 
 func TestMetrics_CacheGauges(t *testing.T) {
-	inst := createMetricsTestInstance()
+	inst := createMetricsTestInstance(t)
 	label := inst.Config.Schema
 
 	// Populate group metadata cache: 3 groups — 2 private, 1 hidden, 1 closed
@@ -167,7 +170,7 @@ func TestMetrics_CacheGauges(t *testing.T) {
 }
 
 func TestMetrics_DBGauges(t *testing.T) {
-	inst := createMetricsTestInstance()
+	inst := createMetricsTestInstance(t)
 	label := inst.Config.Schema
 
 	// Store some events: 2 chat messages (kind 9), 1 regular event
@@ -176,12 +179,16 @@ func TestMetrics_DBGauges(t *testing.T) {
 		{Kind: 9, CreatedAt: nostr.Now(), Tags: nostr.Tags{{"h", "g1"}}, Content: "world"},
 		{Kind: 1, CreatedAt: nostr.Now(), Content: "note"},
 	} {
-		inst.Events.SignAndStoreEvent(&evt, false)
+		if err := inst.Events.SignAndStoreEvent(&evt, false); err != nil {
+			t.Fatalf("SignAndStoreEvent failed: %v", err)
+		}
 	}
 
 	// ANALYZE to update reltuples
 	eventsTable := inst.Events.Schema.Prefix("events")
-	GetDb().Exec(fmt.Sprintf("ANALYZE %s", eventsTable))
+	if _, err := GetDb().Exec(fmt.Sprintf("ANALYZE %s", eventsTable)); err != nil {
+		t.Fatalf("ANALYZE failed: %v", err)
+	}
 
 	withTestInstance(t, inst, func() {
 		collectMetrics()
@@ -200,7 +207,7 @@ func TestMetrics_DBGauges(t *testing.T) {
 }
 
 func TestMetrics_GroupMembersCap(t *testing.T) {
-	inst := createMetricsTestInstance()
+	inst := createMetricsTestInstance(t)
 	label := inst.Config.Schema
 
 	// Create 1005 public groups with 1 member each
@@ -230,7 +237,7 @@ func TestMetrics_GroupMembersCap(t *testing.T) {
 }
 
 func TestMetrics_StaleGroupsCleared(t *testing.T) {
-	inst := createMetricsTestInstance()
+	inst := createMetricsTestInstance(t)
 	label := inst.Config.Schema
 
 	// First collection: group exists (public, so it gets per-group metric)
@@ -261,7 +268,7 @@ func TestMetrics_StaleGroupsCleared(t *testing.T) {
 }
 
 func TestMetrics_PrivateGroupsNotExposed(t *testing.T) {
-	inst := createMetricsTestInstance()
+	inst := createMetricsTestInstance(t)
 	label := inst.Config.Schema
 
 	pk := nostr.Generate().Public()
@@ -308,7 +315,7 @@ func TestMetrics_PrivateGroupsNotExposed(t *testing.T) {
 }
 
 func TestMetrics_QueryDurationHistogram(t *testing.T) {
-	inst := createMetricsTestInstance()
+	inst := createMetricsTestInstance(t)
 
 	// Count observations before
 	before := testutil.CollectAndCount(QueryDuration)
@@ -325,7 +332,7 @@ func TestMetrics_QueryDurationHistogram(t *testing.T) {
 }
 
 func TestMetrics_ConcurrentCollect(t *testing.T) {
-	inst := createMetricsTestInstance()
+	inst := createMetricsTestInstance(t)
 
 	inst.Groups.metadataCache.Store("g1", &groupMetaCache{found: true})
 	inst.Groups.membershipCache.Store("g1", &memberSet{
@@ -348,8 +355,8 @@ func TestMetrics_ConcurrentCollect(t *testing.T) {
 }
 
 func TestMetrics_MultipleInstances(t *testing.T) {
-	inst1 := createMetricsTestInstance()
-	inst2 := createMetricsTestInstance()
+	inst1 := createMetricsTestInstance(t)
+	inst2 := createMetricsTestInstance(t)
 
 	// Different schemas = different instance labels
 	if inst1.Config.Schema == inst2.Config.Schema {

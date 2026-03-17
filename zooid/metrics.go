@@ -137,16 +137,44 @@ func StartMetricsCollector() {
 	}()
 }
 
+// activeInstances tracks which instance labels were seen in the last collection,
+// so we can clean up metrics for unloaded instances.
+var activeInstances = make(map[string]struct{})
+
 func collectMetrics() {
 	collectMu.Lock()
 	defer collectMu.Unlock()
 
 	instances := GetAllInstances()
 
+	currentInstances := make(map[string]struct{}, len(instances))
 	for _, inst := range instances {
+		label := instanceLabel(inst)
+		currentInstances[label] = struct{}{}
 		collectCacheMetrics(inst)
 		collectDBMetrics(inst)
 	}
+
+	// Delete metrics for instances that were unloaded since last cycle.
+	for label := range activeInstances {
+		if _, ok := currentInstances[label]; !ok {
+			match := prometheus.Labels{"instance": label}
+			groupsTotal.DeletePartialMatch(match)
+			groupsPrivate.DeletePartialMatch(match)
+			groupsHidden.DeletePartialMatch(match)
+			groupsClosed.DeletePartialMatch(match)
+			groupMembers.DeletePartialMatch(match)
+			groupMembersTotal.DeletePartialMatch(match)
+			groupsTracked.DeletePartialMatch(match)
+			relayMembersTotal.DeletePartialMatch(match)
+			bannedPubkeysTotal.DeletePartialMatch(match)
+			bannedEventsTotal.DeletePartialMatch(match)
+			eventsTotal.DeletePartialMatch(match)
+			messagesTotal.DeletePartialMatch(match)
+		}
+	}
+
+	activeInstances = currentInstances
 }
 
 func collectCacheMetrics(inst *Instance) {

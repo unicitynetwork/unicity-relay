@@ -41,11 +41,10 @@ func Start() {
 		log.Fatalf("Failed to scan config directory: %v", err)
 	}
 
-	instancesMux.Lock()
-	instancesOnce.Do(func() {
-		instancesByHost = make(map[string]*Instance)
-		instancesByName = make(map[string]*Instance)
-	})
+	// Build instances outside the lock so MakeInstance (DB init, cache warming)
+	// doesn't block Dispatch or metrics collection.
+	newByHost := make(map[string]*Instance)
+	newByName := make(map[string]*Instance)
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
@@ -56,10 +55,22 @@ func Start() {
 		if err != nil {
 			log.Printf("Failed to make instance for %s: %v", entry.Name(), err)
 		} else {
-			instancesByHost[instance.Config.Host] = instance
-			instancesByName[entry.Name()] = instance
+			newByHost[instance.Config.Host] = instance
+			newByName[entry.Name()] = instance
 			log.Printf("Loaded %s", entry.Name())
 		}
+	}
+
+	instancesMux.Lock()
+	instancesOnce.Do(func() {
+		instancesByHost = make(map[string]*Instance)
+		instancesByName = make(map[string]*Instance)
+	})
+	for k, v := range newByHost {
+		instancesByHost[k] = v
+	}
+	for k, v := range newByName {
+		instancesByName[k] = v
 	}
 	instancesMux.Unlock()
 
