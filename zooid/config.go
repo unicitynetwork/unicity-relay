@@ -1,13 +1,20 @@
 package zooid
 
 import (
-	"fiatjaf.com/nostr"
 	"fmt"
-	"github.com/BurntSushi/toml"
+	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"fiatjaf.com/nostr"
+	"github.com/BurntSushi/toml"
 )
+
 
 type Role struct {
 	Pubkeys   []string `toml:"pubkeys"`
@@ -38,6 +45,10 @@ type Config struct {
 		AdminCreateOnly         bool `toml:"admin_create_only"`          // Only admins can create groups
 		PrivateAdminOnly        bool `toml:"private_admin_only"`         // Only admins can create private groups
 		PrivateRelayAdminAccess bool `toml:"private_relay_admin_access"` // Relay admins can see and moderate private groups
+		Retention               struct {
+			Default string            `toml:"default"` // Default retention duration (e.g. "7d", "24h"); empty = unlimited
+			Groups  map[string]string `toml:"groups"`  // Per-group retention overrides keyed by group ID
+		} `toml:"retention"`
 	} `toml:"groups"`
 
 	Management struct {
@@ -70,6 +81,11 @@ func LoadConfig(filename string) (*Config, error) {
 
 	if config.Schema == "" {
 		return nil, fmt.Errorf("schema is required")
+	}
+
+	// Validate retention config early so operators get immediate feedback
+	if err := config.validateRetention(); err != nil {
+		return nil, fmt.Errorf("invalid retention config in %s: %w", path, err)
 	}
 
 	secret, err := nostr.SecretKeyFromHex(config.Secret)
@@ -196,4 +212,98 @@ func (config *Config) CanManage(pubkey nostr.PubKey) bool {
 	}
 
 	return false
+}
+
+// ParseRetentionDuration parses a retention duration string like "30s", "5m", "24h", "7d".
+// Returns 0 for empty strings (meaning unlimited). Supports s(econds), m(inutes), h(ours), d(ays).
+func ParseRetentionDuration(s string) (time.Duration, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+
+	if len(s) < 2 {
+		return 0, fmt.Errorf("invalid retention duration: %q", s)
+	}
+
+	unit := s[len(s)-1]
+	valueStr := s[:len(s)-1]
+
+	value, err := strconv.ParseInt(valueStr, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid retention duration: %q", s)
+	}
+
+	if value <= 0 {
+		return 0, fmt.Errorf("retention duration must be positive: %q", s)
+	}
+
+	var multiplier time.Duration
+	switch unit {
+	case 's':
+		multiplier = time.Second
+	case 'm':
+		multiplier = time.Minute
+	case 'h':
+		multiplier = time.Hour
+	case 'd':
+		multiplier = 24 * time.Hour
+	default:
+		return 0, fmt.Errorf("invalid retention duration unit %q in %q (use s, m, h, or d)", string(unit), s)
+	}
+
+	// Guard against int64 overflow: max time.Duration is ~292 years in nanoseconds.
+	maxValue := math.MaxInt64 / int64(multiplier)
+	if value > maxValue {
+		return 0, fmt.Errorf("retention duration too large: %q", s)
+	}
+
+	return time.Duration(value) * multiplier, nil
+}
+
+// validateRetention checks all retention duration strings at config load time.
+func (config *Config) validateRetention() error {
+	if config.Groups.Retention.Default != "" {
+		if _, err := ParseRetentionDuration(config.Groups.Retention.Default); err != nil {
+			return fmt.Errorf("default: %w", err)
+		}
+	}
+	for groupID, s := range config.Groups.Retention.Groups {
+		if _, err := ParseRetentionDuration(s); err != nil {
+			return fmt.Errorf("group %q: %w", groupID, err)
+		}
+	}
+	return nil
+}
+
+// HasRetention returns true if any retention policy is configured (default or per-group).
+func (config *Config) HasRetention() bool {
+	if config.Groups.Retention.Default != "" {
+		return true
+	}
+	return len(config.Groups.Retention.Groups) > 0
+}
+
+// GetRetention returns the retention duration for a group. Per-group overrides
+// take precedence over the default. Returns 0 (unlimited) if no retention is configured.
+// Since values are validated at config load time, parse errors here are unexpected
+// and logged as warnings.
+func (config *Config) GetRetention(groupID string) time.Duration {
+	if config.Groups.Retention.Groups != nil {
+		if s, ok := config.Groups.Retention.Groups[groupID]; ok {
+			d, err := ParseRetentionDuration(s)
+			if err != nil {
+				log.Printf("retention: unexpected invalid duration for group %q: %v", groupID, err)
+			} else if d > 0 {
+				return d
+			}
+		}
+	}
+
+	d, err := ParseRetentionDuration(config.Groups.Retention.Default)
+	if err != nil {
+		log.Printf("retention: unexpected invalid default duration: %v", err)
+		return 0
+	}
+	return d
 }

@@ -50,6 +50,7 @@ func main() {
 
 	go zooid.Start()
 	zooid.StartMetricsCollector()
+	zooid.StartRetentionCleaner()
 
 	<-shutdown
 
