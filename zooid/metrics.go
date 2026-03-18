@@ -127,12 +127,11 @@ func instanceLabel(inst *Instance) string {
 
 const maxTrackedGroups = 1000
 
-// StartMetricsCollector launches a background goroutine that updates
-// Prometheus metrics every 30 seconds.
+// StartMetricsCollector launches background goroutines that update
+// Prometheus metrics. Most metrics refresh every 30 seconds; per-group
+// message counts run every 2 minutes to reduce CPU load.
 func StartMetricsCollector() {
 	go func() {
-		// Initial collection — may return empty if instances haven't loaded yet,
-		// but avoids serving zeros for the first 30 seconds once they have.
 		collectMetrics()
 
 		ticker := time.NewTicker(30 * time.Second)
@@ -140,6 +139,17 @@ func StartMetricsCollector() {
 
 		for range ticker.C {
 			collectMetrics()
+		}
+	}()
+
+	go func() {
+		collectGroupMessages()
+
+		ticker := time.NewTicker(2 * time.Minute)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			collectGroupMessages()
 		}
 	}()
 }
@@ -171,7 +181,6 @@ func collectMetrics() {
 			groupsHidden.DeletePartialMatch(match)
 			groupsClosed.DeletePartialMatch(match)
 			groupMembers.DeletePartialMatch(match)
-			groupMessages.DeletePartialMatch(match)
 			groupMembersTotal.DeletePartialMatch(match)
 			groupsTracked.DeletePartialMatch(match)
 			relayMembersTotal.DeletePartialMatch(match)
@@ -298,9 +307,33 @@ func collectDBMetrics(inst *Instance) {
 		messagesTotal.With(label).Set(float64(msgCount))
 	}
 
-	// Per-group message counts — single grouped query, skip private/hidden.
-	groupMessages.DeletePartialMatch(prometheus.Labels{"instance": instLabel})
-	collectGroupMessageCounts(inst, instLabel)
+}
+
+var (
+	groupMessagesMu              sync.Mutex
+	activeGroupMessageInstances = make(map[string]struct{})
+)
+
+func collectGroupMessages() {
+	groupMessagesMu.Lock()
+	defer groupMessagesMu.Unlock()
+
+	instances := GetAllInstances()
+
+	currentInstances := make(map[string]struct{}, len(instances))
+	for _, inst := range instances {
+		instLabel := instanceLabel(inst)
+		currentInstances[instLabel] = struct{}{}
+		groupMessages.DeletePartialMatch(prometheus.Labels{"instance": instLabel})
+		collectGroupMessageCounts(inst, instLabel)
+	}
+
+	for label := range activeGroupMessageInstances {
+		if _, ok := currentInstances[label]; !ok {
+			groupMessages.DeletePartialMatch(prometheus.Labels{"instance": label})
+		}
+	}
+	activeGroupMessageInstances = currentInstances
 }
 
 func collectGroupMessageCounts(inst *Instance, instLabel string) {

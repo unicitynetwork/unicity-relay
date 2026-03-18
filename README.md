@@ -109,6 +109,24 @@ Configures NIP 29 support.
 
 Groups also support a `write-restricted` metadata flag (set in the group creation content JSON). When set, only members with the `writer` role, relay admins, and the group creator can post. The `writer` role is assigned via kind 9000 (put-user) events with `["p", "<pubkey>", "writer"]` tags. Only relay admins can create write-restricted groups or add the flag to existing groups.
 
+#### `[groups.retention]`
+
+Configures automatic deletion of old chat messages (kinds 9, 10) on a per-group basis. Membership, metadata, and admin events are never deleted. A background goroutine checks every minute and deletes expired messages in batches.
+
+- `default` — default retention duration for all groups. Empty or omitted means unlimited (no deletion).
+- `[groups.retention.groups]` — per-group overrides keyed by group ID (the NIP-29 `h` tag value). Takes precedence over `default`.
+
+Duration format: integer + unit suffix — `s` (seconds), `m` (minutes), `h` (hours), `d` (days). Examples: `"30s"`, `"24h"`, `"7d"`. Validated at config load time.
+
+```toml
+[groups.retention]
+default = ""              # unlimited (no deletion)
+
+[groups.retention.groups]
+"ephemeral-chat" = "1h"       # group ID → retention duration
+"daily-standup" = "7d"
+```
+
 ### `[management]`
 
 Configures NIP 86 support.
@@ -154,6 +172,9 @@ strip_signatures = false
 [groups]
 enabled = true
 auto_join = false
+
+[groups.retention]
+default = ""
 
 [management]
 enabled = true
@@ -274,6 +295,8 @@ All metrics carry an `instance` label derived from the relay's `schema` config v
 | `zooid_events_total` | Gauge | Estimated total events in database (via `reltuples`) |
 | `zooid_messages_total` | Gauge | Total chat messages (kinds 9, 10) in database |
 | `zooid_query_duration_seconds` | Histogram | Duration of database query execution and row scanning |
+| `zooid_retention_deleted_total` | Counter | Total chat messages deleted by retention policy |
+| `zooid_retention_run_duration_seconds` | Histogram | Duration of each retention cleanup run |
 
 ### Forwarding to Grafana Cloud with Alloy
 

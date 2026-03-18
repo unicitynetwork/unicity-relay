@@ -65,3 +65,18 @@ Groups have three independent flags set via metadata tags: `private` (content re
 - `groups.admin_create_only` — restricts group creation to admins
 - `groups.private_admin_only` — restricts private group creation to admins
 - `groups.auto_join` — allows joining groups without approval
+
+### Message Retention Policy
+
+Per-group retention policy for auto-deleting old chat messages (kinds 9, 10). Configured in TOML by the relay operator — not via Nostr events. Membership, metadata, and admin events are never deleted. A background goroutine (`retention.go`) runs every minute, deleting expired messages in batches of 10,000.
+
+```toml
+[groups.retention]
+default = ""             # unlimited (no deletion); set e.g. "30d" to enable
+
+[groups.retention.groups]
+"ephemeral-chat" = "1h"  # group ID → retention duration
+"daily-standup" = "7d"
+```
+
+Duration format: integer + unit suffix (`s`, `m`, `h`, `d`). Validated at config load time. Hot-reload safe — config changes take effect within 1 minute.
