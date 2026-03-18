@@ -276,12 +276,18 @@ func (config *Config) validateRetention() error {
 	return nil
 }
 
-// HasRetention returns true if any retention policy is configured (default or per-group).
+// HasRetention returns true if any effective retention policy is configured
+// (a non-empty default or at least one per-group override that parses to a positive duration).
 func (config *Config) HasRetention() bool {
-	if config.Groups.Retention.Default != "" {
+	if d, err := ParseRetentionDuration(config.Groups.Retention.Default); err == nil && d > 0 {
 		return true
 	}
-	return len(config.Groups.Retention.Groups) > 0
+	for _, s := range config.Groups.Retention.Groups {
+		if d, err := ParseRetentionDuration(s); err == nil && d > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // GetRetention returns the retention duration for a group. Per-group overrides

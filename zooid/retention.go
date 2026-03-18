@@ -107,7 +107,7 @@ func deleteExpiredGroupMessages(inst *Instance, groupID string, cutoff int64) in
 
 	var totalDeleted int64
 	for {
-		subquery := sb.Select("e.id").
+		subquery := sb.Select("DISTINCT e.id").
 			From(eventsTable + " e").
 			Join(tagsTable + " t ON t.event_id = e.id").
 			Where(squirrel.Eq{"t.key": "h"}).

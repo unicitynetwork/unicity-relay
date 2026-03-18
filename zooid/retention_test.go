@@ -1,6 +1,7 @@
 package zooid
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -34,8 +35,12 @@ func TestParseRetentionDuration(t *testing.T) {
 		{"99999999999999999s", 0, true},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
+	for i, tt := range tests {
+		name := tt.input
+		if name == "" {
+			name = fmt.Sprintf("#%d_empty", i)
+		}
+		t.Run(name, func(t *testing.T) {
 			got, err := ParseRetentionDuration(tt.input)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ParseRetentionDuration(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
@@ -112,6 +117,13 @@ func TestHasRetention(t *testing.T) {
 	config2.Groups.Retention.Groups = map[string]string{"g": "1h"}
 	if !config2.HasRetention() {
 		t.Error("expected HasRetention() == true with per-group set")
+	}
+
+	// All per-group values empty — no effective retention
+	config3 := &Config{}
+	config3.Groups.Retention.Groups = map[string]string{"g": ""}
+	if config3.HasRetention() {
+		t.Error("expected HasRetention() == false when all per-group values are empty")
 	}
 }
 
