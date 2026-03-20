@@ -3,6 +3,7 @@ package zooid
 import (
 	"encoding/json"
 	"sort"
+	"strconv"
 	"sync"
 
 	"fiatjaf.com/nostr"
@@ -219,6 +220,8 @@ func (g *GroupStore) UpdateMetadata(event nostr.Event) error {
 		if len(tag) >= 2 && tag[0] == "h" {
 			h = tag[1]
 			tags = append(tags, nostr.Tag{"d", tag[1]})
+		} else if len(tag) >= 1 && tag[0] == "member_count" {
+			continue // strip client-supplied member_count; relay computes it
 		} else {
 			tags = append(tags, tag)
 		}
@@ -239,6 +242,11 @@ func (g *GroupStore) UpdateMetadata(event nostr.Event) error {
 		if wr, ok := contentData["write-restricted"].(bool); ok && wr {
 			tags = append(tags, nostr.Tag{"write-restricted"})
 		}
+	}
+
+	// Add member_count tag only for non-private groups to avoid leaking membership info
+	if h != "" && !HasTag(tags, "private") {
+		tags = append(tags, nostr.Tag{"member_count", strconv.Itoa(g.GetMemberCount(h))})
 	}
 
 	metadataEvent := nostr.Event{
@@ -262,6 +270,59 @@ func (g *GroupStore) UpdateMetadata(event nostr.Event) error {
 			writeRestricted: HasTag(tags, "write-restricted"),
 		})
 	}
+
+	return nil
+}
+
+func (g *GroupStore) RefreshMemberCount(h string) error {
+	v, ok := g.metadataCache.Load(h)
+	if !ok {
+		return nil
+	}
+	cached := v.(*groupMetaCache)
+
+	// Private groups don't expose member_count
+	if cached.private {
+		return nil
+	}
+
+	countStr := strconv.Itoa(g.GetMemberCount(h))
+
+	// Short-circuit if the count hasn't changed
+	for _, tag := range cached.event.Tags {
+		if len(tag) >= 2 && tag[0] == "member_count" && tag[1] == countStr {
+			return nil
+		}
+	}
+
+	tags := make(nostr.Tags, 0, len(cached.event.Tags))
+	for _, tag := range cached.event.Tags {
+		if len(tag) >= 1 && tag[0] == "member_count" {
+			continue
+		}
+		tags = append(tags, tag)
+	}
+	tags = append(tags, nostr.Tag{"member_count", countStr})
+
+	metadataEvent := nostr.Event{
+		Kind:      nostr.KindSimpleGroupMetadata,
+		CreatedAt: nostr.Now(),
+		Tags:      tags,
+		Content:   cached.event.Content,
+	}
+
+	if err := g.Events.SignAndStoreEvent(&metadataEvent, true); err != nil {
+		return err
+	}
+
+	g.metadataCache.Store(h, &groupMetaCache{
+		event:           metadataEvent,
+		found:           true,
+		private:         cached.private,
+		hidden:          cached.hidden,
+		closed:          cached.closed,
+		writeRestricted: cached.writeRestricted,
+	})
 
 	return nil
 }
@@ -462,6 +523,20 @@ func (g *GroupStore) GetMembers(h string) []nostr.PubKey {
 	}
 
 	return Keys(members)
+}
+
+func (g *GroupStore) GetMemberCount(h string) int {
+	if g.cachesWarmed {
+		if v, ok := g.membershipCache.Load(h); ok {
+			ms := v.(*memberSet)
+			ms.mu.RLock()
+			count := len(ms.members)
+			ms.mu.RUnlock()
+			return count
+		}
+		return 0
+	}
+	return len(g.GetMembers(h))
 }
 
 func (g *GroupStore) UpdateMembersList(h string) error {

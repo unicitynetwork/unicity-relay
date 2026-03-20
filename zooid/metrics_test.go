@@ -200,6 +200,7 @@ func TestMetrics_DBGauges(t *testing.T) {
 
 	withTestInstance(t, inst, func() {
 		collectMetrics()
+		collectGroupMessages()
 	})
 
 	// eventsTotal uses reltuples estimate — after ANALYZE it should be accurate
