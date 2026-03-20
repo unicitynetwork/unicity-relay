@@ -1031,13 +1031,13 @@ func TestRefreshMemberCount_PreservesOtherTags(t *testing.T) {
 	groups, _ := createTestGroupStore()
 	groups.WarmCaches()
 
-	// Create metadata for a private group
+	// Create metadata for a closed (non-private) group
 	createEvent := nostr.Event{
 		CreatedAt: nostr.Now(),
 		Tags: nostr.Tags{
 			{"h", "preservegrp"},
 		},
-		Content: `{"name":"Test","private":true}`,
+		Content: `{"name":"Test","closed":true}`,
 	}
 	groups.UpdateMetadata(createEvent)
 
@@ -1062,16 +1062,16 @@ func TestRefreshMemberCount_PreservesOtherTags(t *testing.T) {
 		t.Errorf("member_count tag = %q, want %q", memberCount, "2")
 	}
 
-	// Verify "private" tag still exists
-	hasPrivate := false
+	// Verify "closed" tag still exists
+	hasClosed := false
 	for _, tag := range meta.Tags {
-		if len(tag) >= 1 && tag[0] == "private" {
-			hasPrivate = true
+		if len(tag) >= 1 && tag[0] == "closed" {
+			hasClosed = true
 			break
 		}
 	}
-	if !hasPrivate {
-		t.Error("private tag should still exist after RefreshMemberCount")
+	if !hasClosed {
+		t.Error("closed tag should still exist after RefreshMemberCount")
 	}
 
 	// Verify "d" tag still has "preservegrp"
@@ -1081,8 +1081,117 @@ func TestRefreshMemberCount_PreservesOtherTags(t *testing.T) {
 	}
 
 	// Verify content is preserved
-	if meta.Content != `{"name":"Test","private":true}` {
-		t.Errorf("Content = %q, want %q", meta.Content, `{"name":"Test","private":true}`)
+	if meta.Content != `{"name":"Test","closed":true}` {
+		t.Errorf("Content = %q, want %q", meta.Content, `{"name":"Test","closed":true}`)
+	}
+}
+
+func TestUpdateMetadata_PrivateGroupOmitsMemberCount(t *testing.T) {
+	groups, _ := createTestGroupStore()
+	groups.WarmCaches()
+
+	pk := nostr.Generate().Public()
+	groups.AddMember("privgrp", pk)
+
+	createEvent := nostr.Event{
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"h", "privgrp"},
+		},
+		Content: `{"name":"Secret","private":true}`,
+	}
+	groups.UpdateMetadata(createEvent)
+
+	meta, found := groups.GetMetadata("privgrp")
+	if !found {
+		t.Fatal("GetMetadata should return found=true")
+	}
+
+	if findTagValue(meta.Tags, "member_count") != "" {
+		t.Error("private group metadata should not contain member_count tag")
+	}
+}
+
+func TestRefreshMemberCount_PrivateGroupSkipped(t *testing.T) {
+	groups, _ := createTestGroupStore()
+	groups.WarmCaches()
+
+	createEvent := nostr.Event{
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"h", "privrefresh"},
+		},
+		Content: `{"name":"Private","private":true}`,
+	}
+	groups.UpdateMetadata(createEvent)
+
+	groups.AddMember("privrefresh", nostr.Generate().Public())
+
+	// RefreshMemberCount should be a no-op for private groups
+	err := groups.RefreshMemberCount("privrefresh")
+	if err != nil {
+		t.Fatalf("RefreshMemberCount returned error: %v", err)
+	}
+
+	meta, _ := groups.GetMetadata("privrefresh")
+	if findTagValue(meta.Tags, "member_count") != "" {
+		t.Error("private group should not get member_count after RefreshMemberCount")
+	}
+}
+
+func TestUpdateMetadata_StripsClientMemberCount(t *testing.T) {
+	groups, _ := createTestGroupStore()
+	groups.WarmCaches()
+
+	groups.AddMember("stripgrp", nostr.Generate().Public())
+
+	// Client includes a bogus member_count tag
+	editEvent := nostr.Event{
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"h", "stripgrp"},
+			{"member_count", "99999"},
+		},
+		Content: `{"name":"Strip Test"}`,
+	}
+	groups.UpdateMetadata(editEvent)
+
+	meta, found := groups.GetMetadata("stripgrp")
+	if !found {
+		t.Fatal("GetMetadata should return found=true")
+	}
+
+	memberCount := findTagValue(meta.Tags, "member_count")
+	if memberCount != "1" {
+		t.Errorf("member_count = %q, want %q (client-supplied value should be stripped)", memberCount, "1")
+	}
+}
+
+func TestRefreshMemberCount_ShortCircuitsWhenUnchanged(t *testing.T) {
+	groups, _ := createTestGroupStore()
+	groups.WarmCaches()
+
+	createEvent := nostr.Event{
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"h", "nochurn"},
+		},
+		Content: `{"name":"No Churn"}`,
+	}
+	groups.UpdateMetadata(createEvent)
+
+	// First refresh: sets member_count to "0"
+	groups.RefreshMemberCount("nochurn")
+
+	meta1, _ := groups.GetMetadata("nochurn")
+	ts1 := meta1.CreatedAt
+
+	// Second refresh with same count: should short-circuit (no new event)
+	groups.RefreshMemberCount("nochurn")
+
+	meta2, _ := groups.GetMetadata("nochurn")
+	if meta2.CreatedAt != ts1 {
+		t.Error("RefreshMemberCount should not generate a new event when count is unchanged")
 	}
 }
 
