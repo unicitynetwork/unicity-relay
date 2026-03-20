@@ -413,11 +413,13 @@ func (instance *Instance) OnEventSaved(ctx context.Context, event nostr.Event) {
 	if event.Kind == nostr.KindSimpleGroupJoinRequest && instance.Config.Groups.AutoJoin {
 		instance.Groups.AddMember(h, event.PubKey)
 		instance.Groups.UpdateMembersList(h)
+		instance.Groups.RefreshMemberCount(h)
 	}
 
 	if event.Kind == nostr.KindSimpleGroupLeaveRequest {
 		instance.Groups.RemoveMember(h, event.PubKey)
 		instance.Groups.UpdateMembersList(h)
+		instance.Groups.RefreshMemberCount(h)
 	}
 
 	if event.Kind == nostr.KindSimpleGroupPutUser {
@@ -438,6 +440,7 @@ func (instance *Instance) OnEventSaved(ctx context.Context, event nostr.Event) {
 			}
 		}
 		instance.Groups.UpdateMembersList(h)
+		instance.Groups.RefreshMemberCount(h)
 	}
 
 	if event.Kind == nostr.KindSimpleGroupRemoveUser {
@@ -454,12 +457,13 @@ func (instance *Instance) OnEventSaved(ctx context.Context, event nostr.Event) {
 			}
 		}
 		instance.Groups.UpdateMembersList(h)
+		instance.Groups.RefreshMemberCount(h)
 	}
 
 	if event.Kind == nostr.KindSimpleGroupCreateGroup {
 		instance.Groups.creatorCache.Store(h, event.PubKey)
+		instance.Groups.AddMember(h, event.PubKey) // Add creator as member before metadata so member_count is accurate
 		instance.Groups.UpdateMetadata(event)
-		instance.Groups.AddMember(h, event.PubKey) // Add creator as member
 		instance.Groups.UpdateMembersList(h)
 		instance.Groups.UpdateAdminsList(h)
 	}
