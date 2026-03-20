@@ -1184,13 +1184,13 @@ func TestRefreshMemberCount_ShortCircuitsWhenUnchanged(t *testing.T) {
 	groups.RefreshMemberCount("nochurn")
 
 	meta1, _ := groups.GetMetadata("nochurn")
-	ts1 := meta1.CreatedAt
+	id1 := meta1.ID
 
 	// Second refresh with same count: should short-circuit (no new event)
 	groups.RefreshMemberCount("nochurn")
 
 	meta2, _ := groups.GetMetadata("nochurn")
-	if meta2.CreatedAt != ts1 {
+	if meta2.ID != id1 {
 		t.Error("RefreshMemberCount should not generate a new event when count is unchanged")
 	}
 }
