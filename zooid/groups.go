@@ -2,6 +2,7 @@ package zooid
 
 import (
 	"encoding/json"
+	"log"
 	"sort"
 	"strconv"
 	"sync"
@@ -113,7 +114,8 @@ func (g *GroupStore) WarmCaches() {
 		})
 	}
 
-	// Load all group creators
+	// Load all group creators (and collect creation events for self-healing below)
+	var creationEvents []nostr.Event
 	createFilter := nostr.Filter{
 		Kinds: []nostr.Kind{nostr.KindSimpleGroupCreateGroup},
 	}
@@ -123,6 +125,10 @@ func (g *GroupStore) WarmCaches() {
 			continue
 		}
 		g.creatorCache.Store(h, event.PubKey)
+
+		if _, ok := g.metadataCache.Load(h); !ok {
+			creationEvents = append(creationEvents, event)
+		}
 	}
 
 	// Load all group memberships
@@ -163,6 +169,17 @@ func (g *GroupStore) WarmCaches() {
 				delete(rs.roles, pubkey)
 			}
 			rs.mu.Unlock()
+		}
+	}
+
+	// Self-heal: regenerate metadata for groups that have a creation event but
+	// no kind 39000 metadata (e.g. UpdateMetadata failed silently during creation).
+	// This runs after membership loading so member_count is accurate.
+	for _, event := range creationEvents {
+		h := GetGroupIDFromEvent(event)
+		log.Printf("Group %q has a creation event but no metadata — regenerating", h)
+		if err := g.UpdateMetadata(event); err != nil {
+			log.Printf("Failed to regenerate metadata for group %q: %v", h, err)
 		}
 	}
 

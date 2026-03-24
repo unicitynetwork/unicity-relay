@@ -411,15 +411,27 @@ func (instance *Instance) OnEventSaved(ctx context.Context, event nostr.Event) {
 	h := GetGroupIDFromEvent(event)
 
 	if event.Kind == nostr.KindSimpleGroupJoinRequest && instance.Config.Groups.AutoJoin {
-		instance.Groups.AddMember(h, event.PubKey)
-		instance.Groups.UpdateMembersList(h)
-		instance.Groups.RefreshMemberCount(h)
+		if err := instance.Groups.AddMember(h, event.PubKey); err != nil {
+			log.Printf("Failed to add member %s to group %q: %v", event.PubKey, h, err)
+		}
+		if err := instance.Groups.UpdateMembersList(h); err != nil {
+			log.Printf("Failed to update members list for group %q: %v", h, err)
+		}
+		if err := instance.Groups.RefreshMemberCount(h); err != nil {
+			log.Printf("Failed to refresh member count for group %q: %v", h, err)
+		}
 	}
 
 	if event.Kind == nostr.KindSimpleGroupLeaveRequest {
-		instance.Groups.RemoveMember(h, event.PubKey)
-		instance.Groups.UpdateMembersList(h)
-		instance.Groups.RefreshMemberCount(h)
+		if err := instance.Groups.RemoveMember(h, event.PubKey); err != nil {
+			log.Printf("Failed to remove member %s from group %q: %v", event.PubKey, h, err)
+		}
+		if err := instance.Groups.UpdateMembersList(h); err != nil {
+			log.Printf("Failed to update members list for group %q: %v", h, err)
+		}
+		if err := instance.Groups.RefreshMemberCount(h); err != nil {
+			log.Printf("Failed to refresh member count for group %q: %v", h, err)
+		}
 	}
 
 	if event.Kind == nostr.KindSimpleGroupPutUser {
@@ -439,8 +451,12 @@ func (instance *Instance) OnEventSaved(ctx context.Context, event nostr.Event) {
 				instance.Groups.SetMemberRoles(h, pubkey, roles)
 			}
 		}
-		instance.Groups.UpdateMembersList(h)
-		instance.Groups.RefreshMemberCount(h)
+		if err := instance.Groups.UpdateMembersList(h); err != nil {
+			log.Printf("Failed to update members list for group %q: %v", h, err)
+		}
+		if err := instance.Groups.RefreshMemberCount(h); err != nil {
+			log.Printf("Failed to refresh member count for group %q: %v", h, err)
+		}
 	}
 
 	if event.Kind == nostr.KindSimpleGroupRemoveUser {
@@ -456,21 +472,37 @@ func (instance *Instance) OnEventSaved(ctx context.Context, event nostr.Event) {
 				}
 			}
 		}
-		instance.Groups.UpdateMembersList(h)
-		instance.Groups.RefreshMemberCount(h)
+		if err := instance.Groups.UpdateMembersList(h); err != nil {
+			log.Printf("Failed to update members list for group %q: %v", h, err)
+		}
+		if err := instance.Groups.RefreshMemberCount(h); err != nil {
+			log.Printf("Failed to refresh member count for group %q: %v", h, err)
+		}
 	}
 
 	if event.Kind == nostr.KindSimpleGroupCreateGroup {
 		instance.Groups.creatorCache.Store(h, event.PubKey)
-		instance.Groups.AddMember(h, event.PubKey) // Add creator as member before metadata so member_count is accurate
-		instance.Groups.UpdateMetadata(event)
-		instance.Groups.UpdateMembersList(h)
-		instance.Groups.UpdateAdminsList(h)
+		if err := instance.Groups.AddMember(h, event.PubKey); err != nil {
+			log.Printf("Failed to add creator %s to group %q: %v", event.PubKey, h, err)
+		}
+		if err := instance.Groups.UpdateMetadata(event); err != nil {
+			log.Printf("Failed to create metadata for group %q: %v", h, err)
+		}
+		if err := instance.Groups.UpdateMembersList(h); err != nil {
+			log.Printf("Failed to update members list for group %q: %v", h, err)
+		}
+		if err := instance.Groups.UpdateAdminsList(h); err != nil {
+			log.Printf("Failed to update admins list for group %q: %v", h, err)
+		}
 	}
 
 	if event.Kind == nostr.KindSimpleGroupEditMetadata {
-		instance.Groups.UpdateMetadata(event)
-		instance.Groups.UpdateAdminsList(h)
+		if err := instance.Groups.UpdateMetadata(event); err != nil {
+			log.Printf("Failed to update metadata for group %q: %v", h, err)
+		}
+		if err := instance.Groups.UpdateAdminsList(h); err != nil {
+			log.Printf("Failed to update admins list for group %q: %v", h, err)
+		}
 	}
 
 	if event.Kind == nostr.KindSimpleGroupDeleteGroup {
