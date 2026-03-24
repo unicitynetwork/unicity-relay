@@ -114,8 +114,10 @@ func (g *GroupStore) WarmCaches() {
 		})
 	}
 
-	// Load all group creators (and collect creation events for self-healing below)
-	var creationEvents []nostr.Event
+	// Load all group creators (and collect creation events for self-healing below).
+	// QueryEvents returns created_at DESC, so the first event per group ID is the
+	// newest. We keep only that one to avoid older duplicates overwriting metadata.
+	missingMeta := make(map[string]nostr.Event) // group h → newest creation event
 	createFilter := nostr.Filter{
 		Kinds: []nostr.Kind{nostr.KindSimpleGroupCreateGroup},
 	}
@@ -127,7 +129,9 @@ func (g *GroupStore) WarmCaches() {
 		g.creatorCache.Store(h, event.PubKey)
 
 		if _, ok := g.metadataCache.Load(h); !ok {
-			creationEvents = append(creationEvents, event)
+			if _, already := missingMeta[h]; !already {
+				missingMeta[h] = event
+			}
 		}
 	}
 
@@ -175,8 +179,7 @@ func (g *GroupStore) WarmCaches() {
 	// Self-heal: regenerate metadata for groups that have a creation event but
 	// no kind 39000 metadata (e.g. UpdateMetadata failed silently during creation).
 	// This runs after membership loading so member_count is accurate.
-	for _, event := range creationEvents {
-		h := GetGroupIDFromEvent(event)
+	for h, event := range missingMeta {
 		log.Printf("Group %q has a creation event but no metadata — regenerating", h)
 		if err := g.UpdateMetadata(event); err != nil {
 			log.Printf("Failed to regenerate metadata for group %q: %v", h, err)
