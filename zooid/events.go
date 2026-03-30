@@ -428,9 +428,15 @@ func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
 		}
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "40001" {
-			log.Printf("Serialization conflict replacing kind %d d=%q (attempt %d/%d), retrying",
+			if attempt+1 < maxRetries {
+				log.Printf("Serialization conflict replacing kind %d d=%q (attempt %d/%d), retrying",
+					evt.Kind, evt.Tags.GetD(), attempt+1, maxRetries)
+				time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
+				continue
+			}
+			log.Printf("Serialization conflict replacing kind %d d=%q (attempt %d/%d), giving up",
 				evt.Kind, evt.Tags.GetD(), attempt+1, maxRetries)
-			continue
+			break
 		}
 		return err // non-retriable error
 	}

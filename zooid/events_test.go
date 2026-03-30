@@ -1,7 +1,10 @@
 package zooid
 
 import (
+	"context"
+	"database/sql"
 	"testing"
+	"time"
 
 	"fiatjaf.com/nostr"
 )
@@ -491,6 +494,92 @@ func TestEventStore_ReplaceEvent_OlderEvent(t *testing.T) {
 
 	if events[0].Content != "newer content" {
 		t.Errorf("ReplaceEvent() with older event kept wrong content = %q, want %q", events[0].Content, "newer content")
+	}
+}
+
+// TestEventStore_ReplaceEvent_SerializationRetry provokes a real PostgreSQL
+// serialization conflict by holding a SERIALIZABLE transaction open while
+// ReplaceEvent tries to touch the same rows. The first attempt should fail
+// with SQLSTATE 40001 and the retry should succeed.
+func TestEventStore_ReplaceEvent_SerializationRetry(t *testing.T) {
+	store := createTestEventStore()
+	store.Init()
+
+	secret := nostr.Generate()
+
+	// Seed an addressable event so ReplaceEvent has something to read.
+	event1 := nostr.Event{
+		Kind:      nostr.Kind(30023), // addressable kind
+		CreatedAt: nostr.Timestamp(1000000),
+		Content:   "original",
+		Tags:      nostr.Tags{{"d", "conflict-test"}},
+	}
+	event1.Sign(secret)
+	if err := store.ReplaceEvent(event1); err != nil {
+		t.Fatalf("seed ReplaceEvent: %v", err)
+	}
+
+	// Open a SERIALIZABLE transaction that reads the same row, creating a
+	// rw-dependency that will force the next ReplaceEvent to abort once we commit.
+	tx, err := GetDb().BeginTx(context.Background(), &sql.TxOptions{
+		Isolation: sql.LevelSerializable,
+	})
+	if err != nil {
+		t.Fatalf("begin blocking tx: %v", err)
+	}
+
+	// Read inside the blocking tx to establish the dependency.
+	eventsTable := store.Schema.Prefix("events")
+	row := tx.QueryRow("SELECT id FROM "+eventsTable+" WHERE kind = $1 LIMIT 1", int(event1.Kind))
+	var idStr string
+	if err := row.Scan(&idStr); err != nil {
+		tx.Rollback()
+		t.Fatalf("blocking tx read: %v", err)
+	}
+
+	// Write something in the blocking tx to create a real rw-conflict.
+	_, err = tx.Exec("UPDATE "+eventsTable+" SET content = 'blocked' WHERE id = $1", idStr)
+	if err != nil {
+		tx.Rollback()
+		t.Fatalf("blocking tx write: %v", err)
+	}
+
+	// Launch ReplaceEvent in a goroutine — it will block or conflict.
+	done := make(chan error, 1)
+	event2 := nostr.Event{
+		Kind:      nostr.Kind(30023),
+		CreatedAt: nostr.Timestamp(2000000),
+		Content:   "replacement",
+		Tags:      nostr.Tags{{"d", "conflict-test"}},
+	}
+	event2.Sign(secret)
+	go func() {
+		done <- store.ReplaceEvent(event2)
+	}()
+
+	// Give the goroutine a moment to start its transaction, then commit ours
+	// which forces PostgreSQL to abort the other.
+	time.Sleep(50 * time.Millisecond)
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("blocking tx commit: %v", err)
+	}
+
+	// ReplaceEvent should succeed via retry.
+	if err := <-done; err != nil {
+		t.Fatalf("ReplaceEvent with contention should succeed via retry, got: %v", err)
+	}
+
+	// Verify the replacement landed.
+	filter := nostr.Filter{Kinds: []nostr.Kind{nostr.Kind(30023)}, Authors: []nostr.PubKey{secret.Public()}}
+	var results []nostr.Event
+	for evt := range store.QueryEvents(filter, 0) {
+		results = append(results, evt)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 event after retry, got %d", len(results))
+	}
+	if results[0].Content != "replacement" {
+		t.Errorf("content = %q, want %q", results[0].Content, "replacement")
 	}
 }
 
