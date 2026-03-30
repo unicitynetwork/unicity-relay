@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"iter"
 	"log"
@@ -16,6 +17,7 @@ import (
 	"fiatjaf.com/nostr/eventstore"
 	"fiatjaf.com/nostr/khatru"
 	"github.com/Masterminds/squirrel"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -415,8 +417,33 @@ func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
 	// Use a serializable transaction so the read-decide-write-delete cycle is
 	// atomic. Without this, two concurrent goroutines could both read "no
 	// existing event", both insert, and leave duplicate replaceable events.
-	// PostgreSQL may return a serialization error under contention; in that
-	// case the client can simply retry the publish.
+	// PostgreSQL may return a serialization error (SQLSTATE 40001) under
+	// contention; the standard remedy is to retry the transaction.
+	const maxRetries = 3
+	var err error
+	for attempt := range maxRetries {
+		err = events.replaceEventOnce(evt)
+		if err == nil {
+			return nil
+		}
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "40001" {
+			if attempt+1 < maxRetries {
+				log.Printf("Serialization conflict replacing kind %d d=%q (attempt %d/%d), retrying",
+					evt.Kind, evt.Tags.GetD(), attempt+1, maxRetries)
+				time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
+				continue
+			}
+			log.Printf("Serialization conflict replacing kind %d d=%q (attempt %d/%d), giving up",
+				evt.Kind, evt.Tags.GetD(), attempt+1, maxRetries)
+			break
+		}
+		return err // non-retriable error
+	}
+	return fmt.Errorf("serialization conflict after %d retries: %w", maxRetries, err)
+}
+
+func (events *EventStore) replaceEventOnce(evt nostr.Event) error {
 	tx, err := GetDb().BeginTx(context.Background(), &sql.TxOptions{
 		Isolation: sql.LevelSerializable,
 	})
