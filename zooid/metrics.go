@@ -310,7 +310,7 @@ func collectDBMetrics(inst *Instance) {
 }
 
 var (
-	groupMessagesMu              sync.Mutex
+	groupMessagesMu             sync.Mutex
 	activeGroupMessageInstances = make(map[string]struct{})
 )
 
