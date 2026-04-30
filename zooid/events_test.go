@@ -3,6 +3,7 @@ package zooid
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"testing"
 	"time"
 
@@ -714,6 +715,53 @@ func TestEventStore_SaveEvent_DuplicateDoesNotCreateOrphanTags(t *testing.T) {
 	}
 	if count != 1 {
 		t.Errorf("Expected 1 event for tag query after duplicate save, got %d", count)
+	}
+}
+
+// TestEventStore_SaveEvent_LargeMemberListExceedsPgParamLimit guards against
+// regression of issue #13: PostgreSQL's extended protocol caps bind parameters
+// at 65535 per query, and event_tags rows bind 3 parameters each, so a single
+// unchunked INSERT fails outright once an event carries more than ~21,845
+// single-letter tags. NIP-29 kind-39002 group member lists routinely cross
+// this threshold (the announcements group in production has ~27k members).
+func TestEventStore_SaveEvent_LargeMemberListExceedsPgParamLimit(t *testing.T) {
+	store := createTestEventStore()
+	store.Init()
+
+	const memberCount = 22_000
+
+	tags := make(nostr.Tags, 0, memberCount+1)
+	tags = append(tags, []string{"d", "huge-group"})
+	for i := 0; i < memberCount; i++ {
+		// event_tags.value is just TEXT; pubkey validity is irrelevant here.
+		tags = append(tags, []string{"p", fmt.Sprintf("%064x", i), "member"})
+	}
+
+	evt := nostr.Event{
+		Kind:      nostr.Kind(39002),
+		CreatedAt: nostr.Now(),
+		Tags:      tags,
+	}
+	evt.Sign(nostr.Generate())
+
+	if err := store.SaveEvent(evt); err != nil {
+		t.Fatalf("SaveEvent() with %d single-letter tags failed: %v", memberCount, err)
+	}
+
+	// Probe a tag from the second chunk to catch off-by-one bugs in chunk
+	// boundary handling. tags[5001] is the 5000th p-tag, which falls past
+	// the first 5000-row batch (the d-tag at tags[0] consumes one slot).
+	probe := tags[5001][1]
+	filter := nostr.Filter{Tags: nostr.TagMap{"p": []string{probe}}}
+	var found bool
+	for result := range store.QueryEvents(filter, 0) {
+		if result.ID == evt.ID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("event saved but second-chunk p-tag %q not queryable", probe)
 	}
 }
 
