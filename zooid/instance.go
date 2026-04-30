@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"time"
 	"unsafe"
 
 	"fiatjaf.com/nostr"
@@ -59,9 +60,10 @@ func MakeInstance(filename string) (*Instance, error) {
 	}
 
 	groups := &GroupStore{
-		Config:     config,
-		Events:     events,
-		Management: management,
+		Config:        config,
+		Events:        events,
+		Management:    management,
+		DebounceDelay: time.Duration(envInt("GROUP_REWRITE_DEBOUNCE_MS", 200)) * time.Millisecond,
 	}
 
 	instance := &Instance{
@@ -414,10 +416,10 @@ func (instance *Instance) OnEventSaved(ctx context.Context, event nostr.Event) {
 		if err := instance.Groups.AddMember(h, event.PubKey); err != nil {
 			log.Printf("Failed to add member %s to group %q: %v", event.PubKey, h, err)
 		}
-		if err := instance.Groups.UpdateMembersList(h); err != nil {
+		if err := instance.Groups.ScheduleMembersListUpdate(h); err != nil {
 			log.Printf("Failed to update members list for group %q: %v", h, err)
 		}
-		if err := instance.Groups.RefreshMemberCount(h); err != nil {
+		if err := instance.Groups.ScheduleMemberCountRefresh(h); err != nil {
 			log.Printf("Failed to refresh member count for group %q: %v", h, err)
 		}
 	}
@@ -426,10 +428,10 @@ func (instance *Instance) OnEventSaved(ctx context.Context, event nostr.Event) {
 		if err := instance.Groups.RemoveMember(h, event.PubKey); err != nil {
 			log.Printf("Failed to remove member %s from group %q: %v", event.PubKey, h, err)
 		}
-		if err := instance.Groups.UpdateMembersList(h); err != nil {
+		if err := instance.Groups.ScheduleMembersListUpdate(h); err != nil {
 			log.Printf("Failed to update members list for group %q: %v", h, err)
 		}
-		if err := instance.Groups.RefreshMemberCount(h); err != nil {
+		if err := instance.Groups.ScheduleMemberCountRefresh(h); err != nil {
 			log.Printf("Failed to refresh member count for group %q: %v", h, err)
 		}
 	}
@@ -451,10 +453,10 @@ func (instance *Instance) OnEventSaved(ctx context.Context, event nostr.Event) {
 				instance.Groups.SetMemberRoles(h, pubkey, roles)
 			}
 		}
-		if err := instance.Groups.UpdateMembersList(h); err != nil {
+		if err := instance.Groups.ScheduleMembersListUpdate(h); err != nil {
 			log.Printf("Failed to update members list for group %q: %v", h, err)
 		}
-		if err := instance.Groups.RefreshMemberCount(h); err != nil {
+		if err := instance.Groups.ScheduleMemberCountRefresh(h); err != nil {
 			log.Printf("Failed to refresh member count for group %q: %v", h, err)
 		}
 	}
@@ -472,10 +474,10 @@ func (instance *Instance) OnEventSaved(ctx context.Context, event nostr.Event) {
 				}
 			}
 		}
-		if err := instance.Groups.UpdateMembersList(h); err != nil {
+		if err := instance.Groups.ScheduleMembersListUpdate(h); err != nil {
 			log.Printf("Failed to update members list for group %q: %v", h, err)
 		}
-		if err := instance.Groups.RefreshMemberCount(h); err != nil {
+		if err := instance.Groups.ScheduleMemberCountRefresh(h); err != nil {
 			log.Printf("Failed to refresh member count for group %q: %v", h, err)
 		}
 	}
@@ -488,7 +490,7 @@ func (instance *Instance) OnEventSaved(ctx context.Context, event nostr.Event) {
 		if err := instance.Groups.UpdateMetadata(event); err != nil {
 			log.Printf("Failed to create metadata for group %q: %v", h, err)
 		}
-		if err := instance.Groups.UpdateMembersList(h); err != nil {
+		if err := instance.Groups.ScheduleMembersListUpdate(h); err != nil {
 			log.Printf("Failed to update members list for group %q: %v", h, err)
 		}
 		if err := instance.Groups.UpdateAdminsList(h); err != nil {

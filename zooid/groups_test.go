@@ -1,7 +1,9 @@
 package zooid
 
 import (
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"fiatjaf.com/nostr"
 )
@@ -163,4 +165,71 @@ func TestIsPrivateGroupContent(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestGroupStore_ScheduleRewrite_CoalescesBurst verifies the leading-edge
+// debounce: many rapid calls collapse into a single fn invocation that runs
+// after DebounceDelay, and a fresh burst arms a new timer.
+func TestGroupStore_ScheduleRewrite_CoalescesBurst(t *testing.T) {
+	g := &GroupStore{DebounceDelay: 30 * time.Millisecond}
+
+	var calls atomic.Int32
+	fn := func() { calls.Add(1) }
+
+	for range 50 {
+		g.scheduleRewrite("members:group1", fn)
+	}
+	if got := calls.Load(); got != 0 {
+		t.Errorf("calls before delay = %d, want 0", got)
+	}
+
+	time.Sleep(80 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("calls after first burst = %d, want 1", got)
+	}
+
+	// Fresh burst after the timer fired must arm a new run.
+	for range 20 {
+		g.scheduleRewrite("members:group1", fn)
+	}
+	time.Sleep(80 * time.Millisecond)
+	if got := calls.Load(); got != 2 {
+		t.Errorf("calls after second burst = %d, want 2", got)
+	}
+}
+
+// TestGroupStore_ScheduleRewrite_PerKeyIsolation verifies different debounce
+// keys (e.g. members:g1 vs count:g1, or members:g1 vs members:g2) don't share
+// pending slots.
+func TestGroupStore_ScheduleRewrite_PerKeyIsolation(t *testing.T) {
+	g := &GroupStore{DebounceDelay: 30 * time.Millisecond}
+
+	var calls atomic.Int32
+	fn := func() { calls.Add(1) }
+
+	g.scheduleRewrite("members:g1", fn)
+	g.scheduleRewrite("members:g2", fn)
+	g.scheduleRewrite("count:g1", fn)
+	// All three should run independently.
+	time.Sleep(80 * time.Millisecond)
+	if got := calls.Load(); got != 3 {
+		t.Errorf("calls = %d, want 3 (one per distinct key)", got)
+	}
+}
+
+// TestGroupStore_ScheduleMembersList_SyncWhenDelayZero verifies that
+// DebounceDelay = 0 (the test default) preserves the synchronous semantics
+// existing tests rely on — Schedule* runs the underlying op inline and
+// returns its error directly.
+func TestGroupStore_ScheduleMembersList_SyncWhenDelayZero(t *testing.T) {
+	g := &GroupStore{DebounceDelay: 0}
+	// No Events store wired up: UpdateMembersList will reach SignAndStoreEvent
+	// and panic. We only assert that scheduling delegates synchronously,
+	// proven by the panic propagating to this goroutine.
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected synchronous call to panic from nil Events; got no panic")
+		}
+	}()
+	_ = g.ScheduleMembersListUpdate("g1")
 }

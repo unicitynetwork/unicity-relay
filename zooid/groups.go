@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"time"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/nip29"
@@ -92,6 +93,16 @@ type GroupStore struct {
 	roleCache       sync.Map // map[string]*roleSet           (key = group h)
 	creatorCache    sync.Map // map[string]nostr.PubKey       (key = group h)
 	cachesWarmed    bool
+
+	// DebounceDelay coalesces rapid bursts of kind-39002 / kind-39000 rewrites
+	// for the same group into a single publish, scheduled DebounceDelay after
+	// the first scheduled trigger in a burst. NIP-29 requires republishing the
+	// full member list on every change, which is the dominant source of write
+	// contention on large groups (issue #16). Zero (the default for tests)
+	// disables debouncing — Schedule* methods run synchronously.
+	DebounceDelay   time.Duration
+	debounceMu      sync.Mutex
+	debouncePending map[string]struct{}
 }
 
 func (g *GroupStore) WarmCaches() {
@@ -597,6 +608,61 @@ func (g *GroupStore) UpdateMembersList(h string) error {
 	}
 
 	return g.Events.SignAndStoreEvent(&event, true)
+}
+
+// ScheduleMembersListUpdate publishes a fresh kind-39002 for h, debounced by
+// DebounceDelay. Multiple calls within the window coalesce into a single run
+// that observes whatever membership state exists at run time. With DebounceDelay
+// zero (test default) the publish happens synchronously and any error is
+// returned to the caller; otherwise errors are logged from the timer goroutine.
+func (g *GroupStore) ScheduleMembersListUpdate(h string) error {
+	if g.DebounceDelay == 0 {
+		return g.UpdateMembersList(h)
+	}
+	g.scheduleRewrite("members:"+h, func() {
+		if err := g.UpdateMembersList(h); err != nil {
+			log.Printf("Debounced UpdateMembersList failed for group %q: %v", h, err)
+		}
+	})
+	return nil
+}
+
+// ScheduleMemberCountRefresh is the debounced counterpart to RefreshMemberCount.
+// See ScheduleMembersListUpdate for semantics.
+func (g *GroupStore) ScheduleMemberCountRefresh(h string) error {
+	if g.DebounceDelay == 0 {
+		return g.RefreshMemberCount(h)
+	}
+	g.scheduleRewrite("count:"+h, func() {
+		if err := g.RefreshMemberCount(h); err != nil {
+			log.Printf("Debounced RefreshMemberCount failed for group %q: %v", h, err)
+		}
+	})
+	return nil
+}
+
+// scheduleRewrite is leading-edge throttle: the first call for `key` arms a
+// timer; subsequent calls within DebounceDelay are no-ops. When the timer
+// fires, fn runs once and observes the latest cache state, capturing every
+// change that landed during the window.
+func (g *GroupStore) scheduleRewrite(key string, fn func()) {
+	g.debounceMu.Lock()
+	if g.debouncePending == nil {
+		g.debouncePending = make(map[string]struct{})
+	}
+	if _, ok := g.debouncePending[key]; ok {
+		g.debounceMu.Unlock()
+		return
+	}
+	g.debouncePending[key] = struct{}{}
+	g.debounceMu.Unlock()
+
+	time.AfterFunc(g.DebounceDelay, func() {
+		g.debounceMu.Lock()
+		delete(g.debouncePending, key)
+		g.debounceMu.Unlock()
+		fn()
+	})
 }
 
 // Invite Codes

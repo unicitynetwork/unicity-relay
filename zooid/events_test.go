@@ -750,8 +750,8 @@ func TestEventStore_SaveEvent_LargeMemberListExceedsPgParamLimit(t *testing.T) {
 
 	// Probe the first tag of the second batch to catch off-by-one bugs in
 	// chunk-boundary handling. The d-tag at tags[0] occupies one of the
-	// 5000 slots in batch 1 (tags[0..4999]), so batch 2 starts at tags[5000].
-	probe := tags[5000][1]
+	// 15000 slots in batch 1 (tags[0..14999]), so batch 2 starts at tags[15000].
+	probe := tags[15000][1]
 	filter := nostr.Filter{Tags: nostr.TagMap{"p": []string{probe}}}
 	var found bool
 	for result := range store.QueryEvents(filter, 0) {
