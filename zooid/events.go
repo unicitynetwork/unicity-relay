@@ -30,22 +30,22 @@ var sb = squirrel.StatementBuilder.PlaceholderFormat(squirrel.Dollar)
 // per replaceable/addressable save, so we avoid the per-call envInt + Atoi.
 var (
 	ssiConfigOnce    sync.Once
-	ssiMaxRetries    int
+	ssiMaxAttempts   int
 	ssiBaseBackoffMs int
 )
 
 func ssiConfig() (int, int) {
 	ssiConfigOnce.Do(func() {
-		ssiMaxRetries = envInt("SSI_MAX_RETRIES", 6)
-		if ssiMaxRetries < 1 {
-			ssiMaxRetries = 1
+		ssiMaxAttempts = envInt("SSI_MAX_ATTEMPTS", 6)
+		if ssiMaxAttempts < 1 {
+			ssiMaxAttempts = 1
 		}
 		ssiBaseBackoffMs = envInt("SSI_BASE_BACKOFF_MS", 25)
 		if ssiBaseBackoffMs < 0 {
 			ssiBaseBackoffMs = 0
 		}
 	})
-	return ssiMaxRetries, ssiBaseBackoffMs
+	return ssiMaxAttempts, ssiBaseBackoffMs
 }
 
 type EventStore struct {
@@ -464,36 +464,41 @@ func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
 	// jitter, multiple losers wake at the same offset and collide again on
 	// retry — observed in production as ~19% of contended kind-39002 saves
 	// giving up after the original 3-retry policy (issue #16).
-	maxRetries, baseBackoffMs := ssiConfig()
+	maxAttempts, baseBackoffMs := ssiConfig()
 	var err error
-	for attempt := 0; attempt < maxRetries; attempt++ {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
 		err = events.replaceEventOnce(evt)
 		if err == nil {
 			return nil
 		}
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "40001" {
-			if attempt+1 < maxRetries {
-				// Cap the exponential growth so an aggressive SSI_MAX_RETRIES
-				// can't push the shift past int range.
+			if attempt+1 < maxAttempts {
+				// Cap the shift so an aggressive SSI_BASE_BACKOFF_MS can't
+				// overflow int when computing the backoff cap.
 				shift := attempt
 				if shift > 10 {
 					shift = 10
 				}
-				backoffCap := baseBackoffMs << shift
+				maxInt := int(^uint(0) >> 1)
+				safeBaseMs := baseBackoffMs
+				if maxBase := maxInt >> shift; safeBaseMs > maxBase {
+					safeBaseMs = maxBase
+				}
+				backoffCap := safeBaseMs << shift
 				sleepMs := rand.IntN(backoffCap + 1)
 				log.Printf("Serialization conflict replacing kind %d d=%q (attempt %d/%d), retrying in %dms",
-					evt.Kind, evt.Tags.GetD(), attempt+1, maxRetries, sleepMs)
+					evt.Kind, evt.Tags.GetD(), attempt+1, maxAttempts, sleepMs)
 				time.Sleep(time.Duration(sleepMs) * time.Millisecond)
 				continue
 			}
 			log.Printf("Serialization conflict replacing kind %d d=%q (attempt %d/%d), giving up",
-				evt.Kind, evt.Tags.GetD(), attempt+1, maxRetries)
+				evt.Kind, evt.Tags.GetD(), attempt+1, maxAttempts)
 			break
 		}
 		return err // non-retriable error
 	}
-	return fmt.Errorf("serialization conflict after %d retries: %w", maxRetries, err)
+	return fmt.Errorf("serialization conflict after %d attempts: %w", maxAttempts, err)
 }
 
 func (events *EventStore) replaceEventOnce(evt nostr.Event) error {
