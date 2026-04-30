@@ -442,7 +442,13 @@ func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
 	// retry — observed in production as ~19% of contended kind-39002 saves
 	// giving up after the original 3-retry policy (issue #16).
 	maxRetries := envInt("SSI_MAX_RETRIES", 6)
+	if maxRetries < 1 {
+		maxRetries = 1
+	}
 	baseBackoffMs := envInt("SSI_BASE_BACKOFF_MS", 25)
+	if baseBackoffMs < 0 {
+		baseBackoffMs = 0
+	}
 	var err error
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		err = events.replaceEventOnce(evt)

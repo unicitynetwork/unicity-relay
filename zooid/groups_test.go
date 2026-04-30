@@ -217,6 +217,56 @@ func TestGroupStore_ScheduleRewrite_PerKeyIsolation(t *testing.T) {
 	}
 }
 
+// TestGroupStore_ScheduleRewrite_RerunIfDirtyDuringRun verifies that a
+// Schedule call arriving while fn() is running flags the entry dirty, and
+// after fn() completes the runner picks the flag up and re-invokes fn()
+// once. This prevents overlapping SERIALIZABLE rewrites (Copilot review on
+// PR #17) without dropping updates that race with fn's cache read.
+func TestGroupStore_ScheduleRewrite_RerunIfDirtyDuringRun(t *testing.T) {
+	g := &GroupStore{DebounceDelay: 10 * time.Millisecond}
+
+	var calls atomic.Int32
+	block := make(chan struct{})
+	fn := func() {
+		if calls.Add(1) == 1 {
+			<-block // first invocation blocks until the test releases it
+		}
+	}
+
+	g.scheduleRewrite("members:g1", fn)
+
+	// Wait for fn() to start.
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for calls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("first fn invocation didn't start: calls = %d", calls.Load())
+	}
+
+	// Schedule again while fn() is still blocked. With the old delete-before-fn
+	// design this would arm a new timer (overlap); with the dirty-flag design
+	// it should mark the in-flight entry dirty for a follow-up run.
+	g.scheduleRewrite("members:g1", fn)
+
+	// Release fn(). The runner should observe dirty and call fn() once more.
+	close(block)
+
+	deadline = time.Now().Add(200 * time.Millisecond)
+	for calls.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("dirty re-run didn't fire: calls = %d, want 2", got)
+	}
+
+	// And the loop must terminate — no further calls without new schedules.
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 2 {
+		t.Errorf("runner kept looping: calls = %d, want stable at 2", got)
+	}
+}
+
 // TestGroupStore_ScheduleMembersList_SyncWhenDelayZero verifies that
 // DebounceDelay = 0 (the test default) preserves the synchronous semantics
 // existing tests rely on — Schedule* runs the underlying op inline and

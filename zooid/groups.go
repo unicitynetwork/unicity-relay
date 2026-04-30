@@ -102,7 +102,20 @@ type GroupStore struct {
 	// disables debouncing — Schedule* methods run synchronously.
 	DebounceDelay   time.Duration
 	debounceMu      sync.Mutex
-	debouncePending map[string]struct{}
+	debouncePending map[string]*debounceEntry
+}
+
+// debounceEntry tracks one key's pending or in-flight rewrite. While
+// running == false the entry's timer is armed; further Schedule calls in
+// that window are pure no-ops because the upcoming fn() will read the
+// latest cache state. While running == true a Schedule call sets dirty,
+// signalling the runner to call fn() once more after the current run
+// finishes — this serializes rewrites per key (avoiding overlapping
+// SERIALIZABLE transactions) without dropping updates that race with
+// fn's cache read.
+type debounceEntry struct {
+	running bool
+	dirty   bool
 }
 
 func (g *GroupStore) WarmCaches() {
@@ -641,27 +654,46 @@ func (g *GroupStore) ScheduleMemberCountRefresh(h string) error {
 	return nil
 }
 
-// scheduleRewrite is leading-edge throttle: the first call for `key` arms a
-// timer; subsequent calls within DebounceDelay are no-ops. When the timer
-// fires, fn runs once and observes the latest cache state, capturing every
-// change that landed during the window.
+// scheduleRewrite arms a debounce timer for `key`. Calls arriving while the
+// timer is still pending are coalesced into the upcoming fn() run (which
+// reads the latest cache state). Calls arriving while fn() is running set a
+// dirty flag, and the runner re-invokes fn() once after it returns to
+// capture any state that landed mid-run. At most one fn() per key is in
+// flight at any time.
 func (g *GroupStore) scheduleRewrite(key string, fn func()) {
 	g.debounceMu.Lock()
 	if g.debouncePending == nil {
-		g.debouncePending = make(map[string]struct{})
+		g.debouncePending = make(map[string]*debounceEntry)
 	}
-	if _, ok := g.debouncePending[key]; ok {
+	if entry, ok := g.debouncePending[key]; ok {
+		if entry.running {
+			entry.dirty = true
+		}
+		// Else: timer is still pending and fn() will see latest cache.
 		g.debounceMu.Unlock()
 		return
 	}
-	g.debouncePending[key] = struct{}{}
+	entry := &debounceEntry{}
+	g.debouncePending[key] = entry
 	g.debounceMu.Unlock()
 
 	time.AfterFunc(g.DebounceDelay, func() {
-		g.debounceMu.Lock()
-		delete(g.debouncePending, key)
-		g.debounceMu.Unlock()
-		fn()
+		for {
+			g.debounceMu.Lock()
+			entry.running = true
+			entry.dirty = false
+			g.debounceMu.Unlock()
+
+			fn()
+
+			g.debounceMu.Lock()
+			if !entry.dirty {
+				delete(g.debouncePending, key)
+				g.debounceMu.Unlock()
+				return
+			}
+			g.debounceMu.Unlock()
+		}
 	})
 }
 
