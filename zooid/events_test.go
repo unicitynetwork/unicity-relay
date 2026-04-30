@@ -748,10 +748,10 @@ func TestEventStore_SaveEvent_LargeMemberListExceedsPgParamLimit(t *testing.T) {
 		t.Fatalf("SaveEvent() with %d single-letter tags failed: %v", memberCount, err)
 	}
 
-	// Probe a tag from the second chunk to catch off-by-one bugs in chunk
-	// boundary handling. tags[5001] is the 5000th p-tag, which falls past
-	// the first 5000-row batch (the d-tag at tags[0] consumes one slot).
-	probe := tags[5001][1]
+	// Probe the first tag of the second batch to catch off-by-one bugs in
+	// chunk-boundary handling. The d-tag at tags[0] occupies one of the
+	// 5000 slots in batch 1 (tags[0..4999]), so batch 2 starts at tags[5000].
+	probe := tags[5000][1]
 	filter := nostr.Filter{Tags: nostr.TagMap{"p": []string{probe}}}
 	var found bool
 	for result := range store.QueryEvents(filter, 0) {
@@ -761,7 +761,7 @@ func TestEventStore_SaveEvent_LargeMemberListExceedsPgParamLimit(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("event saved but second-chunk p-tag %q not queryable", probe)
+		t.Errorf("event saved but second-batch boundary p-tag %q not queryable", probe)
 	}
 }
 
