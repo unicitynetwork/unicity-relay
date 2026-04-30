@@ -488,4 +488,3 @@ func TestIntegration_QueryPerformance(t *testing.T) {
 		time.Sleep(dur)
 	}
 }
-

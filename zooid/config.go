@@ -15,7 +15,6 @@ import (
 	"github.com/BurntSushi/toml"
 )
 
-
 type Role struct {
 	Pubkeys   []string `toml:"pubkeys"`
 	CanInvite bool     `toml:"can_invite"`
@@ -34,7 +33,7 @@ type Config struct {
 	} `toml:"info"`
 
 	Policy struct {
-		Open            bool `toml:"open"`             // Allow all authenticated users (no membership required)
+		Open            bool `toml:"open"` // Allow all authenticated users (no membership required)
 		PublicJoin      bool `toml:"public_join"`
 		StripSignatures bool `toml:"strip_signatures"`
 	} `toml:"policy"`
