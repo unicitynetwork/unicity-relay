@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"iter"
 	"log"
+	"math/rand/v2"
 	"sort"
 	"strings"
 	"time"
@@ -393,11 +394,12 @@ func (events *EventStore) saveEventWith(runner squirrel.BaseRunner, evt nostr.Ev
 
 	// Insert single-letter tags into event_tags, chunked to stay below
 	// Postgres's 65535 extended-protocol parameter limit. With 3 columns per
-	// row, 5000 rows × 3 = 15000 params keeps every batch well below the cap.
-	// NIP-29 kind-39002 (group member list) events carry one ["p", pubkey,
-	// role] tag per member; without chunking, saves fail outright once a
-	// group exceeds ~21,800 members (issue #13).
-	const tagInsertBatchSize = 5000
+	// row, 15000 rows × 3 = 45000 params is well under the 65535 cap and
+	// cuts the inner round-trip count by ~3× vs. 5k batches — important for
+	// kind-39002 (NIP-29 member list) saves where the whole transaction runs
+	// under SERIALIZABLE isolation and contention is dominated by wall-clock
+	// duration of the critical section (issues #13, #16).
+	const tagInsertBatchSize = 15000
 
 	eventID := evt.ID.Hex()
 	tagsTable := events.Schema.Prefix("event_tags")
@@ -434,9 +436,15 @@ func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
 	// existing event", both insert, and leave duplicate replaceable events.
 	// PostgreSQL may return a serialization error (SQLSTATE 40001) under
 	// contention; the standard remedy is to retry the transaction.
-	const maxRetries = 3
+	//
+	// Backoff is full-jitter exponential: sleep ∈ [0, base<<attempt]. Without
+	// jitter, multiple losers wake at the same offset and collide again on
+	// retry — observed in production as ~19% of contended kind-39002 saves
+	// giving up after the original 3-retry policy (issue #16).
+	maxRetries := envInt("SSI_MAX_RETRIES", 6)
+	baseBackoffMs := envInt("SSI_BASE_BACKOFF_MS", 25)
 	var err error
-	for attempt := range maxRetries {
+	for attempt := 0; attempt < maxRetries; attempt++ {
 		err = events.replaceEventOnce(evt)
 		if err == nil {
 			return nil
@@ -444,9 +452,17 @@ func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "40001" {
 			if attempt+1 < maxRetries {
-				log.Printf("Serialization conflict replacing kind %d d=%q (attempt %d/%d), retrying",
-					evt.Kind, evt.Tags.GetD(), attempt+1, maxRetries)
-				time.Sleep(time.Duration(attempt+1) * 10 * time.Millisecond)
+				// Cap the exponential growth so an aggressive SSI_MAX_RETRIES
+				// can't push the shift past int range.
+				shift := attempt
+				if shift > 10 {
+					shift = 10
+				}
+				backoffCap := baseBackoffMs << shift
+				sleepMs := rand.IntN(backoffCap + 1)
+				log.Printf("Serialization conflict replacing kind %d d=%q (attempt %d/%d), retrying in %dms",
+					evt.Kind, evt.Tags.GetD(), attempt+1, maxRetries, sleepMs)
+				time.Sleep(time.Duration(sleepMs) * time.Millisecond)
 				continue
 			}
 			log.Printf("Serialization conflict replacing kind %d d=%q (attempt %d/%d), giving up",
