@@ -1,0 +1,42 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify formatting
+        run: |
+          unformatted=$(gofmt -l -s .)
+          if [ -n "$unformatted" ]; then
+            echo "The following files need gofmt -s:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Run tests
+        env:
+          # Ryuk is the testcontainers reaper. The GHA runner is ephemeral
+          # and TestMain already calls Terminate(), so we don't need it,
+          # and disabling avoids a class of intermittent CI flakes.
+          TESTCONTAINERS_RYUK_DISABLED: "true"
+        run: go test ./...
