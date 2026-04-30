@@ -59,11 +59,15 @@ func MakeInstance(filename string) (*Instance, error) {
 		Events: events,
 	}
 
+	debounceMs := envInt("GROUP_REWRITE_DEBOUNCE_MS", 200)
+	if debounceMs < 0 {
+		debounceMs = 0
+	}
 	groups := &GroupStore{
 		Config:        config,
 		Events:        events,
 		Management:    management,
-		DebounceDelay: time.Duration(envInt("GROUP_REWRITE_DEBOUNCE_MS", 200)) * time.Millisecond,
+		DebounceDelay: time.Duration(debounceMs) * time.Millisecond,
 	}
 
 	instance := &Instance{
