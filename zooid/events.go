@@ -12,6 +12,7 @@ import (
 	"math/rand/v2"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"fiatjaf.com/nostr"
@@ -24,6 +25,28 @@ import (
 
 // Global Squirrel builder with Dollar placeholder format for PostgreSQL
 var sb = squirrel.StatementBuilder.PlaceholderFormat(squirrel.Dollar)
+
+// SSI retry knobs are read from env once and reused — ReplaceEvent is called
+// per replaceable/addressable save, so we avoid the per-call envInt + Atoi.
+var (
+	ssiConfigOnce    sync.Once
+	ssiMaxRetries    int
+	ssiBaseBackoffMs int
+)
+
+func ssiConfig() (int, int) {
+	ssiConfigOnce.Do(func() {
+		ssiMaxRetries = envInt("SSI_MAX_RETRIES", 6)
+		if ssiMaxRetries < 1 {
+			ssiMaxRetries = 1
+		}
+		ssiBaseBackoffMs = envInt("SSI_BASE_BACKOFF_MS", 25)
+		if ssiBaseBackoffMs < 0 {
+			ssiBaseBackoffMs = 0
+		}
+	})
+	return ssiMaxRetries, ssiBaseBackoffMs
+}
 
 type EventStore struct {
 	Relay  *khatru.Relay
@@ -441,14 +464,7 @@ func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
 	// jitter, multiple losers wake at the same offset and collide again on
 	// retry — observed in production as ~19% of contended kind-39002 saves
 	// giving up after the original 3-retry policy (issue #16).
-	maxRetries := envInt("SSI_MAX_RETRIES", 6)
-	if maxRetries < 1 {
-		maxRetries = 1
-	}
-	baseBackoffMs := envInt("SSI_BASE_BACKOFF_MS", 25)
-	if baseBackoffMs < 0 {
-		baseBackoffMs = 0
-	}
+	maxRetries, baseBackoffMs := ssiConfig()
 	var err error
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		err = events.replaceEventOnce(evt)
