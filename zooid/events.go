@@ -80,7 +80,6 @@ func (events *EventStore) Init() error {
 	return nil
 }
 
-
 func (events *EventStore) initFTS() error {
 	ftsStatements := []string{
 		events.Schema.Render(`ALTER TABLE {{.Name}}__events ADD COLUMN IF NOT EXISTS search_vector tsvector`),
@@ -392,20 +391,36 @@ func (events *EventStore) saveEventWith(runner squirrel.BaseRunner, evt nostr.Ev
 		return eventstore.ErrDupEvent
 	}
 
-	// Insert single-letter tags into event_tags table (batched)
-	tagQb := sb.Insert(events.Schema.Prefix("event_tags")).
-		Columns("event_id", "key", "value")
+	// Insert single-letter tags into event_tags, chunked to stay below
+	// Postgres's 65535 extended-protocol parameter limit. With 3 columns per
+	// row, 5000 rows × 3 = 15000 params keeps every batch well below the cap.
+	// NIP-29 kind-39002 (group member list) events carry one ["p", pubkey,
+	// role] tag per member; without chunking, saves fail outright once a
+	// group exceeds ~21,800 members (issue #13).
+	const tagInsertBatchSize = 5000
 
-	hasTags := false
+	eventID := evt.ID.Hex()
+	tagsTable := events.Schema.Prefix("event_tags")
+	batch := sb.Insert(tagsTable).Columns("event_id", "key", "value")
+	n := 0
+
 	for _, tag := range evt.Tags {
-		if len(tag) >= 2 && len(tag[0]) == 1 {
-			tagQb = tagQb.Values(evt.ID.Hex(), tag[0], tag[1])
-			hasTags = true
+		if len(tag) < 2 || len(tag[0]) != 1 {
+			continue
+		}
+		batch = batch.Values(eventID, tag[0], tag[1])
+		n++
+		if n >= tagInsertBatchSize {
+			if _, err := batch.RunWith(runner).Exec(); err != nil {
+				return fmt.Errorf("failed to save tags for event '%s': %w", evt.ID, err)
+			}
+			batch = sb.Insert(tagsTable).Columns("event_id", "key", "value")
+			n = 0
 		}
 	}
 
-	if hasTags {
-		if _, err := tagQb.RunWith(runner).Exec(); err != nil {
+	if n > 0 {
+		if _, err := batch.RunWith(runner).Exec(); err != nil {
 			return fmt.Errorf("failed to save tags for event '%s': %w", evt.ID, err)
 		}
 	}
