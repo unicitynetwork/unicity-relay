@@ -59,6 +59,8 @@ Groups have three independent flags set via metadata tags: `private` (content re
 
 `DATABASE_URL` (required, PostgreSQL connection string), `PORT` (default 3334), `CONFIG` (default ./config), `MEDIA` (default ./media). See `env.go` and `database.go`.
 
+`PPROF_ADDR` (optional, e.g. `127.0.0.1:6060`) enables `net/http/pprof` on a separate listener. Bind to localhost and reach it via SSH/port-forward — never expose pprof publicly.
+
 ### Config Policy Options
 
 - `policy.open` — allows all authenticated users without relay membership

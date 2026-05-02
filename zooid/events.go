@@ -48,6 +48,22 @@ func ssiConfig() (int, int) {
 	return ssiMaxAttempts, ssiBaseBackoffMs
 }
 
+// Per-call wall-clock budgets for DB transactions. Without a deadline,
+// BeginTx parks the calling goroutine indefinitely on the database/sql pool's
+// (unbounded) wait channel when the pool is saturated — that's the goroutine
+// leak observed in issue #18 after PR #17, where 15k-tag SERIALIZABLE saves
+// hold pool connections for ~2s and 6 jittered retries push individual
+// ReplaceEvent calls to ~13s, easily exhausting the default 20-conn pool.
+//
+// With these bounds, a contended caller fails fast instead of accumulating.
+// The defaults are chosen to be ~3× the legitimate worst case so normal load
+// doesn't see them. They're var (not const) so the regression test in
+// events_test.go can shrink them to keep the test fast.
+var (
+	saveEventTxTimeout      = 30 * time.Second
+	replaceEventTotalBudget = 60 * time.Second
+)
+
 type EventStore struct {
 	Relay  *khatru.Relay
 	Config *Config
@@ -369,7 +385,10 @@ func (events *EventStore) deleteEventWith(runner squirrel.BaseRunner, id nostr.I
 }
 
 func (events *EventStore) SaveEvent(evt nostr.Event) error {
-	tx, err := GetDb().Begin()
+	ctx, cancel := context.WithTimeout(context.Background(), saveEventTxTimeout)
+	defer cancel()
+
+	tx, err := GetDb().BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -464,10 +483,19 @@ func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
 	// jitter, multiple losers wake at the same offset and collide again on
 	// retry — observed in production as ~19% of contended kind-39002 saves
 	// giving up after the original 3-retry policy (issue #16).
+	//
+	// The whole retry loop runs under a single deadline so a caller can't park
+	// indefinitely on the pool wait queue when the pool is saturated (#18).
+	ctx, cancel := context.WithTimeout(context.Background(), replaceEventTotalBudget)
+	defer cancel()
+
 	maxAttempts, baseBackoffMs := ssiConfig()
 	var err error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		err = events.replaceEventOnce(evt)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return fmt.Errorf("replace event budget exceeded after %d attempts: %w", attempt, ctxErr)
+		}
+		err = events.replaceEventOnce(ctx, evt)
 		if err == nil {
 			return nil
 		}
@@ -489,7 +517,13 @@ func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
 				sleepMs := rand.IntN(backoffCap + 1)
 				log.Printf("Serialization conflict replacing kind %d d=%q (attempt %d/%d), retrying in %dms",
 					evt.Kind, evt.Tags.GetD(), attempt+1, maxAttempts, sleepMs)
-				time.Sleep(time.Duration(sleepMs) * time.Millisecond)
+				timer := time.NewTimer(time.Duration(sleepMs) * time.Millisecond)
+				select {
+				case <-ctx.Done():
+					timer.Stop()
+					return fmt.Errorf("replace event budget exceeded after %d attempts: %w", attempt+1, ctx.Err())
+				case <-timer.C:
+				}
 				continue
 			}
 			log.Printf("Serialization conflict replacing kind %d d=%q (attempt %d/%d), giving up",
@@ -501,8 +535,8 @@ func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
 	return fmt.Errorf("serialization conflict after %d attempts: %w", maxAttempts, err)
 }
 
-func (events *EventStore) replaceEventOnce(evt nostr.Event) error {
-	tx, err := GetDb().BeginTx(context.Background(), &sql.TxOptions{
+func (events *EventStore) replaceEventOnce(ctx context.Context, evt nostr.Event) error {
+	tx, err := GetDb().BeginTx(ctx, &sql.TxOptions{
 		Isolation: sql.LevelSerializable,
 	})
 	if err != nil {

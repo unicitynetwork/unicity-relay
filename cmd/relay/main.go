@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"syscall"
@@ -47,6 +48,19 @@ func main() {
 			log.Printf("HTTP server error: %v\n", err)
 		}
 	}()
+
+	// Optional pprof server on a separate port. Bind it to localhost only and
+	// expose via SSH/port-forward in production — the runtime/debug endpoints
+	// must not be reachable from the public internet (issue #18 needed
+	// `goroutine?debug=2` from a leaking task to localize the leak).
+	if pprofAddr := os.Getenv("PPROF_ADDR"); pprofAddr != "" {
+		go func() {
+			log.Printf("pprof server listening on %s\n", pprofAddr)
+			if err := http.ListenAndServe(pprofAddr, nil); err != nil {
+				log.Printf("pprof server error: %v\n", err)
+			}
+		}()
+	}
 
 	go zooid.Start()
 	zooid.StartMetricsCollector()
