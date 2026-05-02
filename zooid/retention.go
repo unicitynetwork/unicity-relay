@@ -2,6 +2,7 @@ package zooid
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -102,50 +103,58 @@ func cleanExpiredMessages() {
 	activeRetentionInstances = currentInstances
 }
 
-func deleteExpiredGroupMessages(inst *Instance, groupID string, cutoff int64) int64 {
+// deleteOneRetentionBatch runs one bounded DELETE batch. Pulled out so the
+// per-iteration ctx can use `defer cancel()` and survive any future early
+// returns added inside the batch logic.
+func deleteOneRetentionBatch(inst *Instance, groupID string, cutoff int64) (rowsAffected int64, more bool, err error) {
 	eventsTable := inst.Events.Schema.Prefix("events")
 	tagsTable := inst.Events.Schema.Prefix("event_tags")
 
+	subquery := sb.Select("DISTINCT e.id").
+		From(eventsTable + " e").
+		Join(tagsTable + " t ON t.event_id = e.id").
+		Where(squirrel.Eq{"t.key": "h"}).
+		Where(squirrel.Eq{"t.value": groupID}).
+		Where(squirrel.Eq{"e.kind": []int{9, 10}}).
+		Where(squirrel.Lt{"e.created_at": cutoff}).
+		Limit(retentionDeleteBatchSize)
+
+	subSQL, subArgs, err := subquery.ToSql()
+	if err != nil {
+		return 0, false, fmt.Errorf("build subquery: %w", err)
+	}
+
+	// DELETE FROM events WHERE id IN (subquery)
+	// CASCADE on event_tags foreign key handles tag cleanup.
+	deleteSQL := "DELETE FROM " + eventsTable + " WHERE id IN (" + subSQL + ")"
+
+	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+	defer cancel()
+
+	result, err := GetDb().ExecContext(ctx, deleteSQL, subArgs...)
+	if err != nil {
+		return 0, false, fmt.Errorf("exec delete: %w", err)
+	}
+
+	rowsAffected, err = result.RowsAffected()
+	if err != nil {
+		return 0, false, fmt.Errorf("rows affected: %w", err)
+	}
+	return rowsAffected, rowsAffected >= retentionDeleteBatchSize, nil
+}
+
+func deleteExpiredGroupMessages(inst *Instance, groupID string, cutoff int64) int64 {
 	var totalDeleted int64
 	for {
-		subquery := sb.Select("DISTINCT e.id").
-			From(eventsTable + " e").
-			Join(tagsTable + " t ON t.event_id = e.id").
-			Where(squirrel.Eq{"t.key": "h"}).
-			Where(squirrel.Eq{"t.value": groupID}).
-			Where(squirrel.Eq{"e.kind": []int{9, 10}}).
-			Where(squirrel.Lt{"e.created_at": cutoff}).
-			Limit(retentionDeleteBatchSize)
-
-		subSQL, subArgs, err := subquery.ToSql()
+		rows, more, err := deleteOneRetentionBatch(inst, groupID, cutoff)
 		if err != nil {
-			log.Printf("retention: failed to build subquery for group %q: %v", groupID, err)
+			log.Printf("retention: %s for group %q", err, groupID)
 			return totalDeleted
 		}
-
-		// DELETE FROM events WHERE id IN (subquery)
-		// CASCADE on event_tags foreign key handles tag cleanup.
-		deleteSQL := "DELETE FROM " + eventsTable + " WHERE id IN (" + subSQL + ")"
-
-		ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
-		result, err := GetDb().ExecContext(ctx, deleteSQL, subArgs...)
-		cancel()
-		if err != nil {
-			log.Printf("retention: failed to delete messages for group %q: %v", groupID, err)
-			return totalDeleted
-		}
-
-		rows, err := result.RowsAffected()
-		if err != nil {
-			log.Printf("retention: failed to get rows affected for group %q: %v", groupID, err)
-			return totalDeleted
-		}
-
 		totalDeleted += rows
-		if rows < retentionDeleteBatchSize {
+		if !more {
 			break
 		}
 	}
-
 	return totalDeleted
 }

@@ -405,4 +405,11 @@ func collectGroupMessageCounts(inst *Instance, instLabel string) {
 			"group":    group,
 		}).Set(float64(count))
 	}
+	// Surface mid-iteration failures (e.g. context deadline exceeded under
+	// pool contention) so we don't silently emit partial group-message
+	// metrics — the per-group counts published before the error are still
+	// recorded but at least operators see something is wrong.
+	if err := rows.Err(); err != nil {
+		log.Printf("metrics: group message counts iteration error: %v", err)
+	}
 }
