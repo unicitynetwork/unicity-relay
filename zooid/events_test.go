@@ -647,7 +647,11 @@ func TestEventStore_ReplaceEvent_PoolSaturation_Issue18(t *testing.T) {
 	// pool wait queue forever and this test hangs.
 	const callers = 50
 	secret := nostr.Generate()
-	done := make(chan error, callers)
+	type callerResult struct {
+		idx int
+		err error
+	}
+	done := make(chan callerResult, callers)
 	for i := 0; i < callers; i++ {
 		go func(idx int) {
 			evt := nostr.Event{
@@ -657,7 +661,7 @@ func TestEventStore_ReplaceEvent_PoolSaturation_Issue18(t *testing.T) {
 				Tags:      nostr.Tags{{"d", fmt.Sprintf("issue18-%d", idx)}},
 			}
 			evt.Sign(secret)
-			done <- store.ReplaceEvent(evt)
+			done <- callerResult{idx: idx, err: store.ReplaceEvent(evt)}
 		}(i)
 	}
 
@@ -668,10 +672,10 @@ func TestEventStore_ReplaceEvent_PoolSaturation_Issue18(t *testing.T) {
 	returned := 0
 	for returned < callers {
 		select {
-		case err := <-done:
+		case res := <-done:
 			returned++
-			if err == nil {
-				t.Errorf("caller %d returned nil error; expected pool-wait timeout", returned)
+			if res.err == nil {
+				t.Errorf("caller idx=%d returned nil error; expected pool-wait timeout", res.idx)
 			}
 		case <-deadline:
 			t.Fatalf("only %d/%d ReplaceEvent calls returned within %s — goroutines are parked on the pool wait queue (issue #18 regression)",

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -14,6 +15,34 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// pprofAddrIsLoopback rejects PPROF_ADDR values that would expose pprof on a
+// public interface. Documentation says "bind to localhost"; this enforces it
+// at startup so a stray PPROF_ADDR=":6060" doesn't leak heap/goroutine dumps.
+// Returns (ok, reason) — reason is empty when ok is true.
+func pprofAddrIsLoopback(addr string) (bool, string) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false, fmt.Sprintf("invalid host:port: %v", err)
+	}
+	if host == "" {
+		// ":6060" with no host listens on all interfaces.
+		return false, "host is empty (binds all interfaces); use 127.0.0.1 or [::1]"
+	}
+	if host == "localhost" {
+		return true, ""
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return false, fmt.Sprintf("could not resolve host %q: %v", host, err)
+	}
+	for _, ip := range ips {
+		if !ip.IsLoopback() {
+			return false, fmt.Sprintf("host %q resolves to non-loopback %s", host, ip)
+		}
+	}
+	return true, ""
+}
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
@@ -54,6 +83,9 @@ func main() {
 	// must not be reachable from the public internet (issue #18 needed
 	// `goroutine?debug=2` from a leaking task to localize the leak).
 	if pprofAddr := os.Getenv("PPROF_ADDR"); pprofAddr != "" {
+		if ok, reason := pprofAddrIsLoopback(pprofAddr); !ok {
+			log.Fatalf("refusing to start pprof on %q: %s — pprof must bind to a loopback address; use SSH/port-forward to access it remotely", pprofAddr, reason)
+		}
 		go func() {
 			log.Printf("pprof server listening on %s\n", pprofAddr)
 			if err := http.ListenAndServe(pprofAddr, nil); err != nil {

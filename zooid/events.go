@@ -499,6 +499,15 @@ func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
 		if err == nil {
 			return nil
 		}
+		// If our budget elapsed during the attempt (BeginTx parked on the pool
+		// wait queue, or pgx aborted mid-tx because the context expired), the
+		// returned error is wrapped as "failed to begin transaction: context
+		// deadline exceeded" or similar. Re-wrap so callers see the same
+		// "budget exceeded" message we use for the proactive ctx.Err() check
+		// above and the retry-sleep ctx.Done branch — keeps log triage simple.
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return fmt.Errorf("replace event budget exceeded after %d attempts: %w", attempt+1, err)
+		}
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == "40001" {
 			if attempt+1 < maxAttempts {
