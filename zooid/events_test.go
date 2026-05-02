@@ -692,6 +692,99 @@ func TestEventStore_ReplaceEvent_PoolSaturation_Issue18(t *testing.T) {
 	}
 }
 
+// withSaturatedPool caps the global db pool to a single connection and parks
+// it in a held tx, then runs body. Restores pool size and unwinds the blocker
+// on return. Used by issue #18 regression tests to prove every code path that
+// touches the pool returns instead of parking forever when the pool is full.
+func withSaturatedPool(t *testing.T, body func()) {
+	t.Helper()
+	db := GetDb()
+	defer db.SetMaxOpenConns(20)
+	db.SetMaxOpenConns(1)
+
+	blockerCtx, cancelBlocker := context.WithCancel(context.Background())
+	defer cancelBlocker()
+
+	blockerReady := make(chan struct{})
+	blockerExited := make(chan struct{})
+	go func() {
+		defer close(blockerExited)
+		tx, err := db.BeginTx(blockerCtx, nil)
+		if err != nil {
+			t.Errorf("blocker BeginTx: %v", err)
+			close(blockerReady)
+			return
+		}
+		if _, err := tx.ExecContext(blockerCtx, "SELECT 1"); err != nil {
+			t.Errorf("blocker keepalive query: %v", err)
+		}
+		close(blockerReady)
+		<-blockerCtx.Done()
+		_ = tx.Rollback()
+	}()
+	<-blockerReady
+
+	body()
+
+	cancelBlocker()
+	select {
+	case <-blockerExited:
+	case <-time.After(time.Second):
+		t.Errorf("blocker goroutine did not exit after cancel")
+	}
+}
+
+// TestEventStore_QueryEvents_PoolSaturation_Issue18 covers the second leak
+// path identified in issue #18: the pprof goroutine dump on sha-67fb306
+// showed ~84% of parked goroutines waiting in QueryEvents.queryEventsWith
+// at events.go:169 — `database/sql.(*DB).Query()` with no context, parked
+// forever on the pool wait queue. PR #19 only bounded BeginTx in
+// SaveEvent/ReplaceEvent so the leak just rerouted through the read path.
+//
+// This test mirrors the ReplaceEvent saturation test for the read path:
+// fire N concurrent QueryEvents iterations against a 1-conn pool that is
+// fully held, and assert each iterator terminates cleanly via the per-call
+// dbOpTimeout instead of hanging.
+func TestEventStore_QueryEvents_PoolSaturation_Issue18(t *testing.T) {
+	store := createTestEventStore()
+	if err := store.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	origTimeout := dbOpTimeout
+	dbOpTimeout = 300 * time.Millisecond
+	defer func() { dbOpTimeout = origTimeout }()
+
+	withSaturatedPool(t, func() {
+		const callers = 50
+		done := make(chan struct{}, callers)
+		for i := 0; i < callers; i++ {
+			go func() {
+				// Drain the iter.Seq fully — that's what khatru's REQ handler
+				// does (`for event := range rl.QueryStored(ctx, filter)`).
+				// Pre-fix this hangs in (*DB).Query waiting for a conn.
+				count := 0
+				for range store.QueryEvents(nostr.Filter{Kinds: []nostr.Kind{nostr.KindTextNote}}, 100) {
+					count++
+				}
+				done <- struct{}{}
+			}()
+		}
+
+		deadline := time.After(5 * dbOpTimeout)
+		returned := 0
+		for returned < callers {
+			select {
+			case <-done:
+				returned++
+			case <-deadline:
+				t.Fatalf("only %d/%d QueryEvents iterators terminated within %s — goroutines are parked on the pool wait queue (issue #18 regression in the read path)",
+					returned, callers, 5*dbOpTimeout)
+			}
+		}
+	})
+}
+
 func TestEventStore_CountEvents(t *testing.T) {
 	store := createTestEventStore()
 	store.Init()
