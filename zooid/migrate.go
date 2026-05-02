@@ -3,6 +3,7 @@ package zooid
 import (
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -40,9 +41,16 @@ func RunMigrations(ctx context.Context, schema *Schema) error {
 
 		kvKey := fmt.Sprintf("migration:%s:%s", schema.Name, entry.Name())
 
-		if _, err := kv.Get(ctx, kvKey); err == nil {
-			// Already applied.
+		// Distinguish "key not found" (migration pending) from any other
+		// error (ctx cancel, DB fault). Treating all errors as "not found"
+		// would silently re-run migrations against a sick DB, risking
+		// duplicate-apply effects on non-idempotent migrations.
+		_, err := kv.Get(ctx, kvKey)
+		if err == nil {
 			continue
+		}
+		if !errors.Is(err, ErrKVNotFound) {
+			return fmt.Errorf("checking migration %s applied state: %w", entry.Name(), err)
 		}
 
 		raw, err := migrationFiles.ReadFile("migrations/" + entry.Name())
@@ -52,13 +60,20 @@ func RunMigrations(ctx context.Context, schema *Schema) error {
 
 		rendered := schema.Render(string(raw))
 
-		// Split on semicolons to execute each statement individually.
+		// Split on semicolons to execute each statement individually. Each
+		// statement gets a fresh per-statement deadline derived from ctx —
+		// the caller's ctx is typically the long-lived service root with no
+		// deadline, so without this a stalled DB at startup hangs forever
+		// despite ExecContext being used.
 		for _, stmt := range strings.Split(rendered, ";") {
 			stmt = strings.TrimSpace(stmt)
 			if stmt == "" {
 				continue
 			}
-			if _, err := GetDb().ExecContext(ctx, stmt); err != nil {
+			subctx, cancel := context.WithTimeout(ctx, dbOpTimeout)
+			_, err := GetDb().ExecContext(subctx, stmt)
+			cancel()
+			if err != nil {
 				return fmt.Errorf("migration %s failed: %w", entry.Name(), err)
 			}
 		}
