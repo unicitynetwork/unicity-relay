@@ -157,11 +157,28 @@ func (events *EventStore) Close() {
 	// Never close the database, since it's a shared resource
 }
 
+// QueryEvents satisfies eventstore.Store. Top-level callers don't have a
+// ctx (the interface signature predates context propagation), so we apply
+// dbOpTimeout inside the iter.Seq closure — this bounds the connection
+// acquire and the query+iteration without holding the timer past the
+// caller's last yield. Internal callers that already own a ctx (e.g.
+// replaceEventOnce) should call queryEventsWith directly and pass it.
 func (events *EventStore) QueryEvents(filter nostr.Filter, maxLimit int) iter.Seq[nostr.Event] {
-	return events.queryEventsWith(GetDb(), filter, maxLimit)
+	return func(yield func(nostr.Event) bool) {
+		ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+		defer cancel()
+		for evt := range events.queryEventsWith(ctx, GetDb(), filter, maxLimit) {
+			if !yield(evt) {
+				return
+			}
+		}
+	}
 }
 
-func (events *EventStore) queryEventsWith(runner squirrel.BaseRunner, filter nostr.Filter, maxLimit int) iter.Seq[nostr.Event] {
+// queryEventsWith runs the read query under the caller's ctx so timeouts
+// and cancellation flow from the parent (e.g. replaceEventOnce's 60s
+// budget). The caller is responsible for setting any deadline on ctx.
+func (events *EventStore) queryEventsWith(ctx context.Context, runner squirrel.BaseRunner, filter nostr.Filter, maxLimit int) iter.Seq[nostr.Event] {
 	return func(yield func(nostr.Event) bool) {
 		if filter.LimitZero {
 			return
@@ -170,15 +187,6 @@ func (events *EventStore) queryEventsWith(runner squirrel.BaseRunner, filter nos
 		if maxLimit > 0 && (filter.Limit == 0 || maxLimit < filter.Limit) {
 			filter.Limit = maxLimit
 		}
-
-		// Per-call deadline — both for the pool acquire (BeginTx-equivalent
-		// happens inside Query) and for the query+iteration. PR #19 bounded
-		// BeginTx in SaveEvent/ReplaceEvent, but this read path was the
-		// dominant leak source in issue #18: pprof showed ~84% of parked
-		// goroutines here, all on `database/sql.(*DB).conn` waiting forever
-		// for a connection from a saturated pool.
-		ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
-		defer cancel()
 
 		observer := QueryDuration.With(prometheus.Labels{"instance": events.Config.Schema})
 		queryStart := time.Now()
@@ -391,13 +399,17 @@ func (events *EventStore) buildTagFilteredQuery(filter nostr.Filter, tagFilters 
 	panic("unreachable — see buildSelectQueryWithTags")
 }
 
+// DeleteEvent satisfies eventstore.Store; applies dbOpTimeout to the
+// delete. Internal callers with their own ctx should call deleteEventWith.
 func (events *EventStore) DeleteEvent(id nostr.ID) error {
-	return events.deleteEventWith(GetDb(), id)
-}
-
-func (events *EventStore) deleteEventWith(runner squirrel.BaseRunner, id nostr.ID) error {
 	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
 	defer cancel()
+	return events.deleteEventWith(ctx, GetDb(), id)
+}
+
+// deleteEventWith runs the delete under the caller's ctx so timeouts flow
+// from the parent (e.g. replaceEventOnce's tx budget).
+func (events *EventStore) deleteEventWith(ctx context.Context, runner squirrel.BaseRunner, id nostr.ID) error {
 	_, err := sb.Delete(events.Schema.Prefix("events")).Where(squirrel.Eq{"id": id.Hex()}).RunWith(runner).ExecContext(ctx)
 	return err
 }
@@ -412,7 +424,7 @@ func (events *EventStore) SaveEvent(evt nostr.Event) error {
 	}
 	defer tx.Rollback()
 
-	if err := events.saveEventWith(tx, evt); err != nil {
+	if err := events.saveEventWith(ctx, tx, evt); err != nil {
 		return err
 	}
 
@@ -420,19 +432,16 @@ func (events *EventStore) SaveEvent(evt nostr.Event) error {
 }
 
 // saveEventWith inserts an event and its tags using the provided runner.
-// The caller is responsible for transaction management.
-//
-// Each Exec uses its own per-call context budget so a saturated pool can't
-// park individual statements forever. The outer SaveEvent / replaceEventOnce
-// budgets bound the total tx wall-clock; this bounds the inner ops.
-func (events *EventStore) saveEventWith(runner squirrel.BaseRunner, evt nostr.Event) error {
+// The caller is responsible for transaction management AND for setting any
+// deadline on `ctx` — every inner Exec uses it, so the entire insert chain
+// (event row + each tag batch) shares one wall-clock budget. This is
+// intentional: ReplaceEvent's 60s and SaveEvent's 30s outer budgets are
+// designed to bound the whole save, not each individual statement.
+func (events *EventStore) saveEventWith(ctx context.Context, runner squirrel.BaseRunner, evt nostr.Event) error {
 	tagsJSON, err := json.Marshal(evt.Tags)
 	if err != nil {
 		return fmt.Errorf("failed to marshal tags: %w", err)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
-	defer cancel()
 
 	// Insert the event, using ON CONFLICT to atomically detect duplicates.
 	// This is race-safe with PostgreSQL's concurrent connections (unlike SELECT-then-INSERT).
@@ -585,7 +594,7 @@ func (events *EventStore) replaceEventOnce(ctx context.Context, evt nostr.Event)
 
 	shouldSave := true
 	shouldDelete := make([]nostr.ID, 0)
-	for previous := range events.queryEventsWith(tx, filter, 0) {
+	for previous := range events.queryEventsWith(ctx, tx, filter, 0) {
 		if previous.CreatedAt <= evt.CreatedAt {
 			shouldDelete = append(shouldDelete, previous.ID)
 		} else {
@@ -594,13 +603,13 @@ func (events *EventStore) replaceEventOnce(ctx context.Context, evt nostr.Event)
 	}
 
 	if shouldSave {
-		if err := events.saveEventWith(tx, evt); err != nil && err != eventstore.ErrDupEvent {
+		if err := events.saveEventWith(ctx, tx, evt); err != nil && err != eventstore.ErrDupEvent {
 			return fmt.Errorf("failed to save: %w", err)
 		}
 	}
 
 	for _, id := range shouldDelete {
-		if err := events.deleteEventWith(tx, id); err != nil {
+		if err := events.deleteEventWith(ctx, tx, id); err != nil {
 			return fmt.Errorf("failed to delete old event: %w", err)
 		}
 	}

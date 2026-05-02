@@ -693,45 +693,63 @@ func TestEventStore_ReplaceEvent_PoolSaturation_Issue18(t *testing.T) {
 }
 
 // withSaturatedPool caps the global db pool to a single connection and parks
-// it in a held tx, then runs body. Restores pool size and unwinds the blocker
-// on return. Used by issue #18 regression tests to prove every code path that
-// touches the pool returns instead of parking forever when the pool is full.
+// it in a held tx, then runs body. Restores the original pool size and
+// unwinds the blocker on return — even if body calls t.Fatal/FailNow (which
+// uses runtime.Goexit and skips non-deferred cleanup). Used by issue #18
+// regression tests to prove every code path that touches the pool returns
+// instead of parking forever when the pool is full.
 func withSaturatedPool(t *testing.T, body func()) {
 	t.Helper()
 	db := GetDb()
-	defer db.SetMaxOpenConns(20)
+
+	// Capture the live pool size so we don't leak a hard-coded value into
+	// other tests that may have set DB_MAX_OPEN_CONNS differently.
+	origMaxOpen := db.Stats().MaxOpenConnections
+	defer db.SetMaxOpenConns(origMaxOpen)
 	db.SetMaxOpenConns(1)
 
 	blockerCtx, cancelBlocker := context.WithCancel(context.Background())
 	defer cancelBlocker()
 
-	blockerReady := make(chan struct{})
+	// Surface blocker setup failures to the main goroutine so the test fails
+	// before body() runs against an unsaturated pool — otherwise a silent
+	// blocker failure would let body() succeed against a normal-sized pool
+	// and mask leak regressions.
+	blockerReady := make(chan error, 1)
 	blockerExited := make(chan struct{})
 	go func() {
 		defer close(blockerExited)
 		tx, err := db.BeginTx(blockerCtx, nil)
 		if err != nil {
-			t.Errorf("blocker BeginTx: %v", err)
-			close(blockerReady)
+			blockerReady <- fmt.Errorf("BeginTx: %w", err)
 			return
 		}
 		if _, err := tx.ExecContext(blockerCtx, "SELECT 1"); err != nil {
-			t.Errorf("blocker keepalive query: %v", err)
+			_ = tx.Rollback()
+			blockerReady <- fmt.Errorf("keepalive: %w", err)
+			return
 		}
-		close(blockerReady)
+		blockerReady <- nil
 		<-blockerCtx.Done()
 		_ = tx.Rollback()
 	}()
-	<-blockerReady
+	if err := <-blockerReady; err != nil {
+		t.Fatalf("withSaturatedPool: blocker setup failed (pool not actually saturated): %v", err)
+	}
+
+	// Defer unwinding so it runs even if body t.Fatal's via runtime.Goexit.
+	// Without this, a fatal in body() would leave the blocker goroutine
+	// holding the conn and bleed into subsequent tests in the package.
+	defer func() {
+		cancelBlocker()
+		select {
+		case <-blockerExited:
+		case <-time.After(time.Second):
+			t.Errorf("blocker goroutine did not exit after cancel")
+		}
+	}()
 
 	body()
-
-	cancelBlocker()
-	select {
-	case <-blockerExited:
-	case <-time.After(time.Second):
-		t.Errorf("blocker goroutine did not exit after cancel")
-	}
 }
 
 // TestEventStore_QueryEvents_PoolSaturation_Issue18 covers the second leak
