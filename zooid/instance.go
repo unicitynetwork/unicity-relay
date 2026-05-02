@@ -18,6 +18,11 @@ import (
 )
 
 type Instance struct {
+	// Ctx is the service-level root context, propagated from main via
+	// signal.NotifyContext. Stored here so per-call DB timeouts in
+	// EventStore/etc. can derive from it instead of context.Background().
+	// Cancellation flows through on SIGTERM, aborting in-flight work.
+	Ctx        context.Context
 	Relay      *khatru.Relay
 	Config     *Config
 	Events     *EventStore
@@ -26,7 +31,7 @@ type Instance struct {
 	Groups     *GroupStore
 }
 
-func MakeInstance(filename string) (*Instance, error) {
+func MakeInstance(ctx context.Context, filename string) (*Instance, error) {
 	config, err := LoadConfig(filename)
 	if err != nil {
 		return nil, err
@@ -47,6 +52,7 @@ func MakeInstance(filename string) (*Instance, error) {
 		Schema: &Schema{
 			Name: slug.Make(config.Schema),
 		},
+		rootCtx: ctx,
 	}
 
 	blossom := &BlossomStore{
@@ -71,6 +77,7 @@ func MakeInstance(filename string) (*Instance, error) {
 	}
 
 	instance := &Instance{
+		Ctx:        ctx,
 		Relay:      relay,
 		Config:     config,
 		Events:     events,

@@ -1,6 +1,7 @@
 package zooid
 
 import (
+	"context"
 	"testing"
 
 	"fiatjaf.com/nostr"
@@ -15,9 +16,10 @@ func createTestManagementStore() *ManagementStore {
 	schema := &Schema{Name: "test_" + RandomString(8)}
 	relay := &khatru.Relay{}
 	events := &EventStore{
-		Relay:  relay,
-		Config: config,
-		Schema: schema,
+		Relay:   relay,
+		Config:  config,
+		Schema:  schema,
+		rootCtx: context.Background(),
 	}
 	events.Init()
 

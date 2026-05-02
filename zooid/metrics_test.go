@@ -1,6 +1,7 @@
 package zooid
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
@@ -21,9 +22,10 @@ func createMetricsTestInstance(t *testing.T) *Instance {
 	schema := &Schema{Name: config.Schema}
 	relay := khatru.NewRelay()
 	events := &EventStore{
-		Relay:  relay,
-		Config: config,
-		Schema: schema,
+		Relay:   relay,
+		Config:  config,
+		Schema:  schema,
+		rootCtx: context.Background(),
 	}
 	if err := events.Init(); err != nil {
 		t.Fatalf("events.Init failed: %v", err)
@@ -117,7 +119,7 @@ func TestMetrics_CacheGauges(t *testing.T) {
 	inst.Management.bannedEvents.Store(fakeEvt.ID, "abuse")
 
 	withTestInstance(t, inst, func() {
-		collectMetrics()
+		collectMetrics(context.Background())
 	})
 
 	// Group counts
@@ -199,8 +201,8 @@ func TestMetrics_DBGauges(t *testing.T) {
 	}
 
 	withTestInstance(t, inst, func() {
-		collectMetrics()
-		collectGroupMessages()
+		collectMetrics(context.Background())
+		collectGroupMessages(context.Background())
 	})
 
 	// eventsTotal uses reltuples estimate — after ANALYZE it should be accurate
@@ -240,7 +242,7 @@ func TestMetrics_GroupMembersCap(t *testing.T) {
 	}
 
 	withTestInstance(t, inst, func() {
-		collectMetrics()
+		collectMetrics(context.Background())
 	})
 
 	// groupsTracked should be capped at 1000
@@ -267,7 +269,7 @@ func TestMetrics_StaleGroupsCleared(t *testing.T) {
 	})
 
 	withTestInstance(t, inst, func() {
-		collectMetrics()
+		collectMetrics(context.Background())
 	})
 
 	if v := testutil.ToFloat64(groupMembers.WithLabelValues(label, "old-group")); v != 1 {
@@ -278,7 +280,7 @@ func TestMetrics_StaleGroupsCleared(t *testing.T) {
 	inst.Groups.membershipCache.Delete("old-group")
 	inst.Groups.metadataCache.Delete("old-group")
 	withTestInstance(t, inst, func() {
-		collectMetrics()
+		collectMetrics(context.Background())
 	})
 
 	// After DeletePartialMatch, the stale gauge should be 0
@@ -307,7 +309,7 @@ func TestMetrics_PrivateGroupsNotExposed(t *testing.T) {
 	})
 
 	withTestInstance(t, inst, func() {
-		collectMetrics()
+		collectMetrics(context.Background())
 	})
 
 	// Public group should be tracked
@@ -367,7 +369,7 @@ func TestMetrics_ConcurrentCollect(t *testing.T) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				collectMetrics()
+				collectMetrics(context.Background())
 			}()
 		}
 		wg.Wait()
@@ -400,7 +402,7 @@ func TestMetrics_MultipleInstances(t *testing.T) {
 		instancesMux.Unlock()
 	}()
 
-	collectMetrics()
+	collectMetrics(context.Background())
 
 	// Each instance should have its own metric
 	if v := testutil.ToFloat64(groupsTotal.WithLabelValues(inst1.Config.Schema)); v != 1 {

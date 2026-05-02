@@ -17,8 +17,9 @@ func createTestEventStore() *EventStore {
 		secret: nostr.Generate(),
 	}
 	return &EventStore{
-		Config: config,
-		Schema: schema,
+		Config:  config,
+		Schema:  schema,
+		rootCtx: context.Background(),
 	}
 }
 

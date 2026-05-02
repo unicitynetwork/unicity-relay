@@ -1,6 +1,7 @@
 package zooid
 
 import (
+	"context"
 	"embed"
 	"fmt"
 	"log"
@@ -15,8 +16,12 @@ var migrationFiles embed.FS
 // Migrations are embedded from zooid/migrations/, templated with the schema
 // prefix, and tracked in the global kv table so each runs at most once per
 // schema. Statements within a file are split on ";" and executed individually.
-func RunMigrations(schema *Schema) error {
-	kv := GetKeyValueStore()
+//
+// ctx is the service root context; it bounds the kv lookups, kv writes, and
+// the migration Execs so a stalled DB at startup fails fast instead of
+// hanging the boot.
+func RunMigrations(ctx context.Context, schema *Schema) error {
+	kv := GetKeyValueStore(ctx)
 
 	entries, err := migrationFiles.ReadDir("migrations")
 	if err != nil {
@@ -35,7 +40,7 @@ func RunMigrations(schema *Schema) error {
 
 		kvKey := fmt.Sprintf("migration:%s:%s", schema.Name, entry.Name())
 
-		if _, err := kv.Get(kvKey); err == nil {
+		if _, err := kv.Get(ctx, kvKey); err == nil {
 			// Already applied.
 			continue
 		}
@@ -53,12 +58,12 @@ func RunMigrations(schema *Schema) error {
 			if stmt == "" {
 				continue
 			}
-			if _, err := GetDb().Exec(stmt); err != nil {
+			if _, err := GetDb().ExecContext(ctx, stmt); err != nil {
 				return fmt.Errorf("migration %s failed: %w", entry.Name(), err)
 			}
 		}
 
-		if err := kv.Set(kvKey, "applied"); err != nil {
+		if err := kv.Set(ctx, kvKey, "applied"); err != nil {
 			return fmt.Errorf("recording migration %s: %w", entry.Name(), err)
 		}
 

@@ -1,6 +1,7 @@
 package zooid
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -10,10 +11,10 @@ func TestRunMigrations_AppliesAndTracks(t *testing.T) {
 	store := createTestEventStore()
 	store.Init()
 
-	kv := GetKeyValueStore()
+	kv := GetKeyValueStore(context.Background())
 
 	key := fmt.Sprintf("migration:%s:001_covering_indexes.sql", store.Schema.Name)
-	val, err := kv.Get(key)
+	val, err := kv.Get(context.Background(), key)
 	if err != nil {
 		t.Fatalf("Migration not tracked in kv: %v", err)
 	}
@@ -26,7 +27,7 @@ func TestRunMigrations_Idempotent(t *testing.T) {
 	store := createTestEventStore()
 	store.Init()
 
-	if err := RunMigrations(store.Schema); err != nil {
+	if err := RunMigrations(context.Background(), store.Schema); err != nil {
 		t.Fatalf("Second RunMigrations() failed: %v", err)
 	}
 }

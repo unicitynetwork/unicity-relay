@@ -34,16 +34,23 @@ func init() {
 
 // StartRetentionCleaner launches a background goroutine that periodically
 // deletes expired chat messages (kinds 9, 10) based on per-group retention
-// policies defined in the TOML config.
-func StartRetentionCleaner() {
+// policies defined in the TOML config. ctx is the service root context;
+// when it cancels (SIGTERM), the cleaner exits and any in-flight DELETE
+// aborts via the per-batch derived context.
+func StartRetentionCleaner(ctx context.Context) {
 	go func() {
-		cleanExpiredMessages()
+		cleanExpiredMessages(ctx)
 
 		ticker := time.NewTicker(1 * time.Minute)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			cleanExpiredMessages()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				cleanExpiredMessages(ctx)
+			}
 		}
 	}()
 }
@@ -52,7 +59,7 @@ func StartRetentionCleaner() {
 // cleanup cycle, so we can clean up metrics for unloaded instances.
 var activeRetentionInstances = make(map[string]struct{})
 
-func cleanExpiredMessages() {
+func cleanExpiredMessages(ctx context.Context) {
 	retentionMu.Lock()
 	defer retentionMu.Unlock()
 
@@ -78,7 +85,7 @@ func cleanExpiredMessages() {
 			}
 
 			cutoff := time.Now().Unix() - int64(retention/time.Second)
-			deleted := deleteExpiredGroupMessages(inst, groupID, cutoff)
+			deleted := deleteExpiredGroupMessages(ctx, inst, groupID, cutoff)
 			if deleted > 0 {
 				totalDeleted += deleted
 				log.Printf("retention: deleted %d messages from group %q (instance %s)", deleted, groupID, inst.Config.Schema)
@@ -105,8 +112,9 @@ func cleanExpiredMessages() {
 
 // deleteOneRetentionBatch runs one bounded DELETE batch. Pulled out so the
 // per-iteration ctx can use `defer cancel()` and survive any future early
-// returns added inside the batch logic.
-func deleteOneRetentionBatch(inst *Instance, groupID string, cutoff int64) (rowsAffected int64, more bool, err error) {
+// returns added inside the batch logic. ctx is the service root passed
+// down from the cleaner — derives a per-batch dbOpTimeout from it.
+func deleteOneRetentionBatch(ctx context.Context, inst *Instance, groupID string, cutoff int64) (rowsAffected int64, more bool, err error) {
 	eventsTable := inst.Events.Schema.Prefix("events")
 	tagsTable := inst.Events.Schema.Prefix("event_tags")
 
@@ -128,10 +136,10 @@ func deleteOneRetentionBatch(inst *Instance, groupID string, cutoff int64) (rows
 	// CASCADE on event_tags foreign key handles tag cleanup.
 	deleteSQL := "DELETE FROM " + eventsTable + " WHERE id IN (" + subSQL + ")"
 
-	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+	subctx, cancel := context.WithTimeout(ctx, dbOpTimeout)
 	defer cancel()
 
-	result, err := GetDb().ExecContext(ctx, deleteSQL, subArgs...)
+	result, err := GetDb().ExecContext(subctx, deleteSQL, subArgs...)
 	if err != nil {
 		return 0, false, fmt.Errorf("exec delete: %w", err)
 	}
@@ -143,10 +151,10 @@ func deleteOneRetentionBatch(inst *Instance, groupID string, cutoff int64) (rows
 	return rowsAffected, rowsAffected >= retentionDeleteBatchSize, nil
 }
 
-func deleteExpiredGroupMessages(inst *Instance, groupID string, cutoff int64) int64 {
+func deleteExpiredGroupMessages(ctx context.Context, inst *Instance, groupID string, cutoff int64) int64 {
 	var totalDeleted int64
 	for {
-		rows, more, err := deleteOneRetentionBatch(inst, groupID, cutoff)
+		rows, more, err := deleteOneRetentionBatch(ctx, inst, groupID, cutoff)
 		if err != nil {
 			log.Printf("retention: %s for group %q", err, groupID)
 			return totalDeleted

@@ -1,6 +1,7 @@
 package zooid
 
 import (
+	"context"
 	"log"
 	"os"
 	"path/filepath"
@@ -25,7 +26,12 @@ func Dispatch(hostname string) (*Instance, bool) {
 	return instance, exists
 }
 
-func Start() {
+// Start blocks until ctx is canceled. ctx is the service-level root context
+// (created once in main from signal.NotifyContext) — every Instance built
+// here stores it on Instance.Ctx, and every per-call DB timeout in this
+// package derives from it. SIGTERM cancels ctx → in-flight DB ops abort
+// instead of running their full per-op budget against a dying process.
+func Start(ctx context.Context) {
 	mediaDir := Env("MEDIA")
 	if err := os.MkdirAll(mediaDir, 0755); err != nil {
 		log.Fatalf("Failed to create media directory: %v", err)
@@ -50,7 +56,7 @@ func Start() {
 			continue
 		}
 
-		instance, err := MakeInstance(entry.Name())
+		instance, err := MakeInstance(ctx, entry.Name())
 
 		if err != nil {
 			log.Printf("Failed to make instance for %s: %v", entry.Name(), err)
@@ -89,6 +95,13 @@ func Start() {
 
 	for {
 		select {
+		case <-ctx.Done():
+			// Service shutting down — stop watching for config changes and
+			// release the watcher's fd. In-flight DB ops on individual
+			// instances abort via their derived contexts; that's handled
+			// at each call site, not here.
+			return
+
 		case event, ok := <-watcher.Events:
 			if !ok {
 				return
@@ -109,7 +122,7 @@ func Start() {
 				if event.Has(fsnotify.Remove) {
 					log.Printf("Unloaded %s", filename)
 				} else {
-					instance, err := MakeInstance(filename)
+					instance, err := MakeInstance(ctx, filename)
 					if err != nil {
 						log.Printf("Failed to reload %s: %v", filename, err)
 					} else {
