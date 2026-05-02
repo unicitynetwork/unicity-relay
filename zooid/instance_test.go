@@ -40,9 +40,10 @@ func createTestInstance() *Instance {
 	relay := &khatru.Relay{}
 
 	events := &EventStore{
-		Relay:  relay,
-		Config: config,
-		Schema: schema,
+		Relay:   relay,
+		Config:  config,
+		Schema:  schema,
+		rootCtx: context.Background(),
 	}
 
 	management := &ManagementStore{

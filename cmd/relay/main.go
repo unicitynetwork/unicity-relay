@@ -47,8 +47,16 @@ func pprofAddrIsLoopback(addr string) (bool, string) {
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lshortfile)
 
-	shutdown := make(chan os.Signal, 1)
-	signal.Notify(shutdown, syscall.SIGINT, syscall.SIGTERM)
+	// rootCtx is the single source of cancellation for the whole process.
+	// Everything that runs inside zooid derives its context from this — no
+	// other place in the codebase calls context.Background(). On SIGINT/
+	// SIGTERM (or stop()) the ctx cancels, which propagates down the tree
+	// to abort in-flight DB ops, fsnotify watcher, metric/retention loops,
+	// etc. Avoiding scattered context.Background() calls also means
+	// graceful shutdown actually stops in-flight goroutines instead of
+	// letting them run their full per-call timeout (issue #18).
+	rootCtx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
 	port := zooid.Env("PORT")
 	metricsHandler := promhttp.Handler()
@@ -94,14 +102,19 @@ func main() {
 		}()
 	}
 
-	go zooid.Start()
-	zooid.StartMetricsCollector()
-	zooid.StartRetentionCleaner()
+	go zooid.Start(rootCtx)
+	zooid.StartMetricsCollector(rootCtx)
+	zooid.StartRetentionCleaner(rootCtx)
 
-	<-shutdown
+	<-rootCtx.Done()
 
 	log.Println("\nShutting down gracefully...")
 
+	// Detached shutdown deadline — once SIGTERM has fired, rootCtx is
+	// already canceled, so we need a fresh budget for the http server's
+	// drain. This is the one legitimate context.Background() in the
+	// process: we're past the lifetime of rootCtx and starting a new,
+	// bounded shutdown phase.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 

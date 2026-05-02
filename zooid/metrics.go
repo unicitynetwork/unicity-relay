@@ -130,27 +130,39 @@ const maxTrackedGroups = 1000
 
 // StartMetricsCollector launches background goroutines that update
 // Prometheus metrics. Most metrics refresh every 30 seconds; per-group
-// message counts run every 2 minutes to reduce CPU load.
-func StartMetricsCollector() {
+// message counts run every 2 minutes to reduce CPU load. ctx is the
+// service root: when canceled (SIGTERM), both tickers exit and any
+// in-flight DB query aborts via the per-call derived contexts.
+func StartMetricsCollector(ctx context.Context) {
 	go func() {
-		collectMetrics()
+		collectMetrics(ctx)
 
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			collectMetrics()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				collectMetrics(ctx)
+			}
 		}
 	}()
 
 	go func() {
-		collectGroupMessages()
+		collectGroupMessages(ctx)
 
 		ticker := time.NewTicker(2 * time.Minute)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			collectGroupMessages()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				collectGroupMessages(ctx)
+			}
 		}
 	}()
 }
@@ -159,7 +171,7 @@ func StartMetricsCollector() {
 // so we can clean up metrics for unloaded instances.
 var activeInstances = make(map[string]struct{})
 
-func collectMetrics() {
+func collectMetrics(ctx context.Context) {
 	collectMu.Lock()
 	defer collectMu.Unlock()
 
@@ -170,7 +182,7 @@ func collectMetrics() {
 		label := instanceLabel(inst)
 		currentInstances[label] = struct{}{}
 		collectCacheMetrics(inst)
-		collectDBMetrics(inst)
+		collectDBMetrics(ctx, inst)
 	}
 
 	// Delete metrics for instances that were unloaded since last cycle.
@@ -281,7 +293,7 @@ func collectCacheMetrics(inst *Instance) {
 	bannedEventsTotal.With(label).Set(bannedEvCount)
 }
 
-func collectDBMetrics(inst *Instance) {
+func collectDBMetrics(ctx context.Context, inst *Instance) {
 	instLabel := instanceLabel(inst)
 	label := prometheus.Labels{"instance": instLabel}
 	eventsTable := inst.Events.Schema.Prefix("events")
@@ -289,12 +301,12 @@ func collectDBMetrics(inst *Instance) {
 	// Use Postgres reltuples estimate — no sequential scan, instant.
 	// GREATEST handles -1 (never-analyzed tables). PostgreSQL lowercases
 	// unquoted identifiers, so match against lowercase.
-	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+	subctx, cancel := context.WithTimeout(ctx, dbOpTimeout)
 	defer cancel()
 
 	var eventsEst float64
 	err := GetDb().QueryRowContext(
-		ctx,
+		subctx,
 		"SELECT GREATEST(COALESCE(reltuples, 0), 0) FROM pg_class WHERE relname = $1",
 		strings.ToLower(eventsTable),
 	).Scan(&eventsEst)
@@ -319,7 +331,7 @@ var (
 	activeGroupMessageInstances = make(map[string]struct{})
 )
 
-func collectGroupMessages() {
+func collectGroupMessages(ctx context.Context) {
 	groupMessagesMu.Lock()
 	defer groupMessagesMu.Unlock()
 
@@ -330,7 +342,7 @@ func collectGroupMessages() {
 		instLabel := instanceLabel(inst)
 		currentInstances[instLabel] = struct{}{}
 		groupMessages.DeletePartialMatch(prometheus.Labels{"instance": instLabel})
-		collectGroupMessageCounts(inst, instLabel)
+		collectGroupMessageCounts(ctx, inst, instLabel)
 	}
 
 	for label := range activeGroupMessageInstances {
@@ -341,7 +353,7 @@ func collectGroupMessages() {
 	activeGroupMessageInstances = currentInstances
 }
 
-func collectGroupMessageCounts(inst *Instance, instLabel string) {
+func collectGroupMessageCounts(ctx context.Context, inst *Instance, instLabel string) {
 	// Collect visible group IDs (not private, not hidden), capped at maxTrackedGroups.
 	visibleGroups := make([]string, 0, maxTrackedGroups)
 	inst.Groups.metadataCache.Range(func(key, value any) bool {
@@ -384,10 +396,10 @@ func collectGroupMessageCounts(inst *Instance, instLabel string) {
 		Where(squirrel.Eq{"e.kind": kindArgs}).
 		GroupBy("t.value")
 
-	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+	subctx, cancel := context.WithTimeout(ctx, dbOpTimeout)
 	defer cancel()
 
-	rows, err := qb.RunWith(GetDb()).QueryContext(ctx)
+	rows, err := qb.RunWith(GetDb()).QueryContext(subctx)
 	if err != nil {
 		log.Printf("metrics: failed to query group message counts: %v", err)
 		return

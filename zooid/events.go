@@ -75,6 +75,12 @@ type EventStore struct {
 	Relay  *khatru.Relay
 	Config *Config
 	Schema *Schema
+
+	// rootCtx is the service-level root, set by MakeInstance from the
+	// process-wide ctx. All per-call DB timeouts derive from it. Tests
+	// set this to context.Background() via createTestEventStore.
+	// Never read directly outside this package.
+	rootCtx context.Context
 }
 
 var _ eventstore.Store = (*EventStore)(nil)
@@ -111,7 +117,7 @@ func (events *EventStore) Init() error {
 	}
 
 	for _, stmt := range statements {
-		if _, err := GetDb().Exec(stmt); err != nil {
+		if _, err := GetDb().ExecContext(events.rootCtx, stmt); err != nil {
 			return fmt.Errorf("schema init failed: %w", err)
 		}
 	}
@@ -120,7 +126,7 @@ func (events *EventStore) Init() error {
 		return fmt.Errorf("FTS init failed: %w", err)
 	}
 
-	if err := RunMigrations(events.Schema); err != nil {
+	if err := RunMigrations(events.rootCtx, events.Schema); err != nil {
 		return fmt.Errorf("migrations failed: %w", err)
 	}
 
@@ -146,7 +152,7 @@ func (events *EventStore) initFTS() error {
 	}
 
 	for _, stmt := range ftsStatements {
-		if _, err := GetDb().Exec(stmt); err != nil {
+		if _, err := GetDb().ExecContext(events.rootCtx, stmt); err != nil {
 			return fmt.Errorf("statement failed: %w", err)
 		}
 	}
@@ -165,7 +171,7 @@ func (events *EventStore) Close() {
 // replaceEventOnce) should call queryEventsWith directly and pass it.
 func (events *EventStore) QueryEvents(filter nostr.Filter, maxLimit int) iter.Seq[nostr.Event] {
 	return func(yield func(nostr.Event) bool) {
-		ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+		ctx, cancel := context.WithTimeout(events.rootCtx, dbOpTimeout)
 		defer cancel()
 		for evt := range events.queryEventsWith(ctx, GetDb(), filter, maxLimit) {
 			if !yield(evt) {
@@ -402,7 +408,7 @@ func (events *EventStore) buildTagFilteredQuery(filter nostr.Filter, tagFilters 
 // DeleteEvent satisfies eventstore.Store; applies dbOpTimeout to the
 // delete. Internal callers with their own ctx should call deleteEventWith.
 func (events *EventStore) DeleteEvent(id nostr.ID) error {
-	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+	ctx, cancel := context.WithTimeout(events.rootCtx, dbOpTimeout)
 	defer cancel()
 	return events.deleteEventWith(ctx, GetDb(), id)
 }
@@ -415,7 +421,7 @@ func (events *EventStore) deleteEventWith(ctx context.Context, runner squirrel.B
 }
 
 func (events *EventStore) SaveEvent(evt nostr.Event) error {
-	ctx, cancel := context.WithTimeout(context.Background(), saveEventTxTimeout)
+	ctx, cancel := context.WithTimeout(events.rootCtx, saveEventTxTimeout)
 	defer cancel()
 
 	tx, err := GetDb().BeginTx(ctx, nil)
@@ -520,7 +526,7 @@ func (events *EventStore) ReplaceEvent(evt nostr.Event) error {
 	//
 	// The whole retry loop runs under a single deadline so a caller can't park
 	// indefinitely on the pool wait queue when the pool is saturated (#18).
-	ctx, cancel := context.WithTimeout(context.Background(), replaceEventTotalBudget)
+	ctx, cancel := context.WithTimeout(events.rootCtx, replaceEventTotalBudget)
 	defer cancel()
 
 	maxAttempts, baseBackoffMs := ssiConfig()
@@ -625,7 +631,7 @@ func (events *EventStore) CountEvents(filter nostr.Filter) (uint32, error) {
 
 	countQb := sb.Select("COUNT(*)").FromSelect(qb, "subquery")
 
-	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+	ctx, cancel := context.WithTimeout(events.rootCtx, dbOpTimeout)
 	defer cancel()
 
 	var count uint32
