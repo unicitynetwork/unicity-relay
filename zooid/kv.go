@@ -2,10 +2,17 @@ package zooid
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
 )
+
+// ErrKVNotFound is the sentinel returned by KeyValueStore.Get when the key
+// doesn't exist. Callers must `errors.Is(err, ErrKVNotFound)` instead of
+// treating any error as missing — context deadlines and DB faults look
+// indistinguishable from "no row" if you only inspect the bool/string.
+var ErrKVNotFound = errors.New("kv key not found")
 
 var (
 	kv     *KeyValueStore
@@ -36,7 +43,13 @@ func (kv *KeyValueStore) Migrate(ctx context.Context) {
 	}
 
 	for _, stmt := range statements {
-		if _, err := GetDb().ExecContext(ctx, stmt); err != nil {
+		// Per-statement deadline — the caller's ctx may be the long-lived
+		// service root, which has no timeout, so a stalled DB at startup
+		// would otherwise hang here forever.
+		subctx, cancel := context.WithTimeout(ctx, dbOpTimeout)
+		_, err := GetDb().ExecContext(subctx, stmt)
+		cancel()
+		if err != nil {
 			log.Fatalf("failed to migrate database: %v", err)
 		}
 	}
@@ -72,7 +85,14 @@ func (kv *KeyValueStore) Get(ctx context.Context, key string) (string, error) {
 		return value, nil
 	}
 
-	return "", fmt.Errorf("%s not found", key)
+	// rows.Err() surfaces context-cancel and driver errors that ended the
+	// iteration before any row arrived — without this check, the not-found
+	// branch below would mask them.
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("kv get %q: %w", key, err)
+	}
+
+	return "", fmt.Errorf("%w: %s", ErrKVNotFound, key)
 }
 
 func (kv *KeyValueStore) Set(ctx context.Context, key string, value string) error {

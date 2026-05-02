@@ -609,88 +609,50 @@ func TestEventStore_ReplaceEvent_PoolSaturation_Issue18(t *testing.T) {
 	replaceEventTotalBudget = 300 * time.Millisecond
 	defer func() { replaceEventTotalBudget = origBudget }()
 
-	db := GetDb()
-
-	// Save and restore the pool size. We can't read the current value out of
-	// *sql.DB, so restore to the documented default after the test.
-	defer db.SetMaxOpenConns(20)
-	db.SetMaxOpenConns(1)
-
-	// Hold the only connection for the duration of the test by parking a tx.
-	// The blocker uses its own background context so the held tx is not
-	// affected by per-caller deadlines.
-	blockerCtx, cancelBlocker := context.WithCancel(context.Background())
-	defer cancelBlocker()
-
-	blockerReady := make(chan struct{})
-	blockerExited := make(chan struct{})
-	go func() {
-		defer close(blockerExited)
-		tx, err := db.BeginTx(blockerCtx, nil)
-		if err != nil {
-			t.Errorf("blocker BeginTx: %v", err)
-			close(blockerReady)
-			return
+	withSaturatedPool(t, func() {
+		// Fan out N concurrent ReplaceEvent calls. With a 1-conn pool fully
+		// held, every caller will fail to acquire a connection and must
+		// return when the per-call budget elapses. Pre-fix behavior parks
+		// all N goroutines on the pool wait queue forever and this test
+		// hangs.
+		const callers = 50
+		secret := nostr.Generate()
+		type callerResult struct {
+			idx int
+			err error
 		}
-		// Touch a row so PostgreSQL holds the connection bound to this tx.
-		if _, err := tx.ExecContext(blockerCtx, "SELECT 1"); err != nil {
-			t.Errorf("blocker keepalive query: %v", err)
+		done := make(chan callerResult, callers)
+		for i := 0; i < callers; i++ {
+			go func(idx int) {
+				evt := nostr.Event{
+					Kind:      nostr.Kind(30023),
+					CreatedAt: nostr.Timestamp(1_000_000 + idx),
+					Content:   fmt.Sprintf("issue18-%d", idx),
+					Tags:      nostr.Tags{{"d", fmt.Sprintf("issue18-%d", idx)}},
+				}
+				evt.Sign(secret)
+				done <- callerResult{idx: idx, err: store.ReplaceEvent(evt)}
+			}(i)
 		}
-		close(blockerReady)
-		<-blockerCtx.Done()
-		_ = tx.Rollback()
-	}()
-	<-blockerReady
 
-	// Fan out N concurrent ReplaceEvent calls. With a 1-conn pool fully held,
-	// every caller will fail to acquire a connection and must return when the
-	// per-call budget elapses. Pre-fix behavior parks all N goroutines on the
-	// pool wait queue forever and this test hangs.
-	const callers = 50
-	secret := nostr.Generate()
-	type callerResult struct {
-		idx int
-		err error
-	}
-	done := make(chan callerResult, callers)
-	for i := 0; i < callers; i++ {
-		go func(idx int) {
-			evt := nostr.Event{
-				Kind:      nostr.Kind(30023),
-				CreatedAt: nostr.Timestamp(1_000_000 + idx),
-				Content:   fmt.Sprintf("issue18-%d", idx),
-				Tags:      nostr.Tags{{"d", fmt.Sprintf("issue18-%d", idx)}},
+		// Allow generous slack: every caller should finish within a few
+		// budget windows even on a slow CI machine. The assertion is "they
+		// finish at all", not the precise timing.
+		deadline := time.After(5 * replaceEventTotalBudget)
+		returned := 0
+		for returned < callers {
+			select {
+			case res := <-done:
+				returned++
+				if res.err == nil {
+					t.Errorf("caller idx=%d returned nil error; expected pool-wait timeout", res.idx)
+				}
+			case <-deadline:
+				t.Fatalf("only %d/%d ReplaceEvent calls returned within %s — goroutines are parked on the pool wait queue (issue #18 regression)",
+					returned, callers, 5*replaceEventTotalBudget)
 			}
-			evt.Sign(secret)
-			done <- callerResult{idx: idx, err: store.ReplaceEvent(evt)}
-		}(i)
-	}
-
-	// Allow generous slack: every caller should finish within a few budget
-	// windows even on a slow CI machine. The point of the assertion is "they
-	// finish at all", not the precise timing.
-	deadline := time.After(5 * replaceEventTotalBudget)
-	returned := 0
-	for returned < callers {
-		select {
-		case res := <-done:
-			returned++
-			if res.err == nil {
-				t.Errorf("caller idx=%d returned nil error; expected pool-wait timeout", res.idx)
-			}
-		case <-deadline:
-			t.Fatalf("only %d/%d ReplaceEvent calls returned within %s — goroutines are parked on the pool wait queue (issue #18 regression)",
-				returned, callers, 5*replaceEventTotalBudget)
 		}
-	}
-
-	// Release the held connection and confirm the blocker tx unwinds cleanly.
-	cancelBlocker()
-	select {
-	case <-blockerExited:
-	case <-time.After(time.Second):
-		t.Errorf("blocker goroutine did not exit after cancel")
-	}
+	})
 }
 
 // withSaturatedPool caps the global db pool to a single connection and parks
