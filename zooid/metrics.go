@@ -1,6 +1,7 @@
 package zooid
 
 import (
+	"context"
 	"log"
 	"strings"
 	"sync"
@@ -288,8 +289,12 @@ func collectDBMetrics(inst *Instance) {
 	// Use Postgres reltuples estimate — no sequential scan, instant.
 	// GREATEST handles -1 (never-analyzed tables). PostgreSQL lowercases
 	// unquoted identifiers, so match against lowercase.
+	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+	defer cancel()
+
 	var eventsEst float64
-	err := GetDb().QueryRow(
+	err := GetDb().QueryRowContext(
+		ctx,
 		"SELECT GREATEST(COALESCE(reltuples, 0), 0) FROM pg_class WHERE relname = $1",
 		strings.ToLower(eventsTable),
 	).Scan(&eventsEst)
@@ -379,7 +384,10 @@ func collectGroupMessageCounts(inst *Instance, instLabel string) {
 		Where(squirrel.Eq{"e.kind": kindArgs}).
 		GroupBy("t.value")
 
-	rows, err := qb.RunWith(GetDb()).Query()
+	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+	defer cancel()
+
+	rows, err := qb.RunWith(GetDb()).QueryContext(ctx)
 	if err != nil {
 		log.Printf("metrics: failed to query group message counts: %v", err)
 		return

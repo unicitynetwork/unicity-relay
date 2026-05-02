@@ -1,6 +1,7 @@
 package zooid
 
 import (
+	"context"
 	"log"
 	"sync"
 	"time"
@@ -126,7 +127,9 @@ func deleteExpiredGroupMessages(inst *Instance, groupID string, cutoff int64) in
 		// CASCADE on event_tags foreign key handles tag cleanup.
 		deleteSQL := "DELETE FROM " + eventsTable + " WHERE id IN (" + subSQL + ")"
 
-		result, err := GetDb().Exec(deleteSQL, subArgs...)
+		ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+		result, err := GetDb().ExecContext(ctx, deleteSQL, subArgs...)
+		cancel()
 		if err != nil {
 			log.Printf("retention: failed to delete messages for group %q: %v", groupID, err)
 			return totalDeleted

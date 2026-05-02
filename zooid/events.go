@@ -49,19 +49,26 @@ func ssiConfig() (int, int) {
 }
 
 // Per-call wall-clock budgets for DB transactions. Without a deadline,
-// BeginTx parks the calling goroutine indefinitely on the database/sql pool's
-// (unbounded) wait channel when the pool is saturated — that's the goroutine
-// leak observed in issue #18 after PR #17, where 15k-tag SERIALIZABLE saves
-// hold pool connections for ~2s and 6 jittered retries push individual
-// ReplaceEvent calls to ~13s, easily exhausting the default 20-conn pool.
+// any database/sql call (BeginTx, Exec, Query, QueryRow) without a context
+// parks the calling goroutine indefinitely on the pool's (unbounded) wait
+// channel when the pool is saturated — that's the goroutine leak in issue
+// #18. PR #19 bounded the BeginTx in SaveEvent/ReplaceEvent; this file's
+// other call sites (queryEventsWith / deleteEventWith / saveEventWith's
+// inner Execs / CountEvents — plus kv.go, metrics.go, retention.go) still
+// used the no-context variants and the leak rerouted through them, with
+// pprof showing ~84% of parked goroutines in QueryEvents.
+//
+// `dbOpTimeout` is the per-call budget used by the *Context variants. It
+// is shared across all runtime DB ops in this package; the outer
+// transaction budgets (`saveEventTxTimeout`, `replaceEventTotalBudget`)
+// stay separate because they bound the *whole* tx including any retries.
 //
 // With these bounds, a contended caller fails fast instead of accumulating.
-// The defaults are chosen to be ~3× the legitimate worst case so normal load
-// doesn't see them. They're var (not const) so the regression test in
-// events_test.go can shrink them to keep the test fast.
+// They're var (not const) so the regression tests can shrink them.
 var (
 	saveEventTxTimeout      = 30 * time.Second
 	replaceEventTotalBudget = 60 * time.Second
+	dbOpTimeout             = 30 * time.Second
 )
 
 type EventStore struct {
@@ -164,9 +171,18 @@ func (events *EventStore) queryEventsWith(runner squirrel.BaseRunner, filter nos
 			filter.Limit = maxLimit
 		}
 
+		// Per-call deadline — both for the pool acquire (BeginTx-equivalent
+		// happens inside Query) and for the query+iteration. PR #19 bounded
+		// BeginTx in SaveEvent/ReplaceEvent, but this read path was the
+		// dominant leak source in issue #18: pprof showed ~84% of parked
+		// goroutines here, all on `database/sql.(*DB).conn` waiting forever
+		// for a connection from a saturated pool.
+		ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+		defer cancel()
+
 		observer := QueryDuration.With(prometheus.Labels{"instance": events.Config.Schema})
 		queryStart := time.Now()
-		rows, err := events.buildSelectQuery(filter).RunWith(runner).Query()
+		rows, err := events.buildSelectQuery(filter).RunWith(runner).QueryContext(ctx)
 		if err != nil {
 			observer.Observe(time.Since(queryStart).Seconds())
 			log.Printf("QueryEvents query error: %v", err)
@@ -380,7 +396,9 @@ func (events *EventStore) DeleteEvent(id nostr.ID) error {
 }
 
 func (events *EventStore) deleteEventWith(runner squirrel.BaseRunner, id nostr.ID) error {
-	_, err := sb.Delete(events.Schema.Prefix("events")).Where(squirrel.Eq{"id": id.Hex()}).RunWith(runner).Exec()
+	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+	defer cancel()
+	_, err := sb.Delete(events.Schema.Prefix("events")).Where(squirrel.Eq{"id": id.Hex()}).RunWith(runner).ExecContext(ctx)
 	return err
 }
 
@@ -403,11 +421,18 @@ func (events *EventStore) SaveEvent(evt nostr.Event) error {
 
 // saveEventWith inserts an event and its tags using the provided runner.
 // The caller is responsible for transaction management.
+//
+// Each Exec uses its own per-call context budget so a saturated pool can't
+// park individual statements forever. The outer SaveEvent / replaceEventOnce
+// budgets bound the total tx wall-clock; this bounds the inner ops.
 func (events *EventStore) saveEventWith(runner squirrel.BaseRunner, evt nostr.Event) error {
 	tagsJSON, err := json.Marshal(evt.Tags)
 	if err != nil {
 		return fmt.Errorf("failed to marshal tags: %w", err)
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+	defer cancel()
 
 	// Insert the event, using ON CONFLICT to atomically detect duplicates.
 	// This is race-safe with PostgreSQL's concurrent connections (unlike SELECT-then-INSERT).
@@ -424,7 +449,7 @@ func (events *EventStore) saveEventWith(runner squirrel.BaseRunner, evt nostr.Ev
 		).
 		Suffix("ON CONFLICT(id) DO NOTHING")
 
-	result, err := insertQb.RunWith(runner).Exec()
+	result, err := insertQb.RunWith(runner).ExecContext(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to save event '%s': %w", evt.ID, err)
 	}
@@ -455,7 +480,7 @@ func (events *EventStore) saveEventWith(runner squirrel.BaseRunner, evt nostr.Ev
 		batch = batch.Values(eventID, tag[0], tag[1])
 		n++
 		if n >= tagInsertBatchSize {
-			if _, err := batch.RunWith(runner).Exec(); err != nil {
+			if _, err := batch.RunWith(runner).ExecContext(ctx); err != nil {
 				return fmt.Errorf("failed to save tags for event '%s': %w", evt.ID, err)
 			}
 			batch = sb.Insert(tagsTable).Columns("event_id", "key", "value")
@@ -464,7 +489,7 @@ func (events *EventStore) saveEventWith(runner squirrel.BaseRunner, evt nostr.Ev
 	}
 
 	if n > 0 {
-		if _, err := batch.RunWith(runner).Exec(); err != nil {
+		if _, err := batch.RunWith(runner).ExecContext(ctx); err != nil {
 			return fmt.Errorf("failed to save tags for event '%s': %w", evt.ID, err)
 		}
 	}
@@ -591,8 +616,11 @@ func (events *EventStore) CountEvents(filter nostr.Filter) (uint32, error) {
 
 	countQb := sb.Select("COUNT(*)").FromSelect(qb, "subquery")
 
+	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+	defer cancel()
+
 	var count uint32
-	err := countQb.RunWith(GetDb()).QueryRow().Scan(&count)
+	err := countQb.RunWith(GetDb()).QueryRowContext(ctx).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("failed to count events: %w", err)
 	}

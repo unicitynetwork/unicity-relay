@@ -1,6 +1,7 @@
 package zooid
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"sync"
@@ -38,11 +39,14 @@ func (kv *KeyValueStore) Migrate() {
 }
 
 func (kv *KeyValueStore) Get(key string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+	defer cancel()
+
 	rows, err := sb.Select("value").
 		From("kv").
 		Where("key = ?", key).
 		RunWith(GetDb()).
-		Query()
+		QueryContext(ctx)
 
 	if err != nil {
 		return "", err
@@ -65,12 +69,15 @@ func (kv *KeyValueStore) Get(key string) (string, error) {
 }
 
 func (kv *KeyValueStore) Set(key string, value string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), dbOpTimeout)
+	defer cancel()
+
 	_, err := sb.Insert("kv").
 		Columns("key", "value").
 		Values(key, value).
 		Suffix("ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value").
 		RunWith(GetDb()).
-		Exec()
+		ExecContext(ctx)
 
 	return err
 }
