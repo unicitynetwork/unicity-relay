@@ -72,6 +72,7 @@ Zooid supports a few environment variables, which configure shared resources lik
 - `DB_MAX_OPEN_CONNS` - maximum open database connections. Defaults to `20`.
 - `DB_MAX_IDLE_CONNS` - maximum idle database connections. Defaults to `5`.
 - `DB_CONN_MAX_LIFETIME_SECS` - connection max lifetime in seconds. Defaults to `300`.
+- `PPROF_ADDR` - if set (e.g. `127.0.0.1:6060`), serves `net/http/pprof` on a separate listener. **Bind to localhost** and reach it via SSH/port-forward — never expose pprof publicly.
 
 ## Configuration
 
@@ -407,3 +408,4 @@ When running in AWS ECS, these environment variables configure the relay:
 | `DB_MAX_OPEN_CONNS` | Max open DB connections (default: `20`) |
 | `DB_MAX_IDLE_CONNS` | Max idle DB connections (default: `5`) |
 | `DB_CONN_MAX_LIFETIME_SECS` | Connection max lifetime in seconds (default: `300`) |
+| `PPROF_ADDR` | If set (e.g. `127.0.0.1:6060`), serves `net/http/pprof` on a separate listener. Bind to localhost only — never expose publicly. |
