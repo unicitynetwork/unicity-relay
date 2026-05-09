@@ -86,13 +86,12 @@ type EventStore struct {
 var _ eventstore.Store = (*EventStore)(nil)
 
 func (events *EventStore) Init() error {
-	// Statements that run BEFORE migrations: create base tables and any
-	// indexes whose definitions reference only base-table columns. The
-	// `event_tags.kind` column was introduced by migration 002, so the
-	// covering index that uses it is created later — see postMigrate
-	// below — to avoid referencing a column that doesn't exist yet on
-	// pre-002 schemas.
-	preMigrate := []string{
+	// Base tables and the indexes whose definitions reference only
+	// columns present in those CREATE TABLE statements. Indexes that
+	// depend on columns added by later migrations live in those
+	// migration files, not here, so we don't reference a column that
+	// doesn't exist yet on a pre-migration schema.
+	statements := []string{
 		events.Schema.Render(`
 			CREATE TABLE IF NOT EXISTS {{.Name}}__events (
 				id TEXT PRIMARY KEY,
@@ -123,7 +122,7 @@ func (events *EventStore) Init() error {
 		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_events_kind_created_at ON {{.Name}}__events(kind, created_at DESC)`),
 	}
 
-	for _, stmt := range preMigrate {
+	for _, stmt := range statements {
 		if _, err := GetDb().ExecContext(events.rootCtx, stmt); err != nil {
 			return fmt.Errorf("schema init failed: %w", err)
 		}
@@ -135,17 +134,6 @@ func (events *EventStore) Init() error {
 
 	if err := RunMigrations(events.rootCtx, events.Schema); err != nil {
 		return fmt.Errorf("migrations failed: %w", err)
-	}
-
-	// Statements that depend on columns added by migrations.
-	postMigrate := []string{
-		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_event_tags_key_value_kind_event_id ON {{.Name}}__event_tags(key, value, kind, event_id)`),
-	}
-
-	for _, stmt := range postMigrate {
-		if _, err := GetDb().ExecContext(events.rootCtx, stmt); err != nil {
-			return fmt.Errorf("schema init (post-migrate) failed: %w", err)
-		}
 	}
 
 	return nil
@@ -220,7 +208,13 @@ func (events *EventStore) queryEventsWith(ctx context.Context, runner squirrel.B
 		queryStart := time.Now()
 		var drainTotal time.Duration
 
-		rows, err := events.buildSelectQuery(filter).RunWith(runner).QueryContext(ctx)
+		qb, err := events.buildSelectQuery(filter)
+		if err != nil {
+			observeQueryTimings(totalObserver, dbObserver, drainObserver, queryStart, drainTotal)
+			log.Printf("QueryEvents buildSelectQuery error: %v", err)
+			return
+		}
+		rows, err := qb.RunWith(runner).QueryContext(ctx)
 		if err != nil {
 			observeQueryTimings(totalObserver, dbObserver, drainObserver, queryStart, drainTotal)
 			log.Printf("QueryEvents query error: %v", err)
@@ -298,7 +292,7 @@ func observeQueryTimings(total, db, drain prometheus.Observer, queryStart time.T
 	drain.Observe(drainTotal.Seconds())
 }
 
-func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectBuilder {
+func (events *EventStore) buildSelectQuery(filter nostr.Filter) (squirrel.SelectBuilder, error) {
 	eventsTable := events.Schema.Prefix("events")
 	eventTagsTable := events.Schema.Prefix("event_tags")
 
@@ -373,11 +367,10 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectB
 			sql, args, err := subQ.ToSql()
 			if err != nil {
 				// squirrel.Select.ToSql only fails for malformed builder
-				// state (unset column lists, etc.) — programmer error,
-				// not user input. Panic so it's caught loudly in tests
-				// rather than silently appending an empty string and
-				// corrupting the CTE.
-				panic(fmt.Errorf("buildSelectQuery: tag CTE ToSql: %w", err))
+				// state, not user input. Propagate so callers in the
+				// query and count paths can log and short-circuit
+				// instead of crashing the process.
+				return squirrel.SelectBuilder{}, fmt.Errorf("buildSelectQuery: tag CTE ToSql: %w", err)
 			}
 			cteParts = append(cteParts, sql)
 			cteArgs = append(cteArgs, args...)
@@ -434,7 +427,7 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectB
 		qb = qb.Limit(uint64(filter.Limit))
 	}
 
-	return qb
+	return qb, nil
 }
 
 // buildTagFilteredQuery constructs a raw SQL query using a materialized CTE
@@ -699,7 +692,11 @@ func (events *EventStore) CountEvents(filter nostr.Filter) (uint32, error) {
 	// Strip limit for a true total count; ORDER BY in the subquery is
 	// optimized away by PostgreSQL's planner inside COUNT(*).
 	filter.Limit = 0
-	qb := events.buildSelectQuery(filter).RemoveLimit()
+	qb, err := events.buildSelectQuery(filter)
+	if err != nil {
+		return 0, fmt.Errorf("failed to build count query: %w", err)
+	}
+	qb = qb.RemoveLimit()
 
 	countQb := sb.Select("COUNT(*)").FromSelect(qb, "subquery")
 
@@ -707,8 +704,7 @@ func (events *EventStore) CountEvents(filter nostr.Filter) (uint32, error) {
 	defer cancel()
 
 	var count uint32
-	err := countQb.RunWith(GetDb()).QueryRowContext(ctx).Scan(&count)
-	if err != nil {
+	if err := countQb.RunWith(GetDb()).QueryRowContext(ctx).Scan(&count); err != nil {
 		return 0, fmt.Errorf("failed to count events: %w", err)
 	}
 
