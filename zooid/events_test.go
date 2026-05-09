@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -1092,6 +1093,16 @@ func TestEventStore_SaveEvent_PopulatesTagKind(t *testing.T) {
 // h-tag dominate the CTE result, then get filtered out at hash-join
 // time. With kind pushed into the CTE, only matching-kind tag rows
 // participate. Issue #23.
+//
+// Two-part assertion:
+//
+//   - Result-level: chat-kind filter on a tag shared with membership
+//     events excludes the membership events from output.
+//   - SQL-shape: the CTE itself contains a `kind` predicate. Without
+//     this check the test would still pass even if the kind pushdown
+//     into the CTE were removed, because the outer events.kind filter
+//     alone produces correct results — it just defeats the whole
+//     point of the optimization.
 func TestEventStore_QueryEvents_TagAndKindCTE(t *testing.T) {
 	store := createTestEventStore()
 	if err := store.Init(); err != nil {
@@ -1129,17 +1140,34 @@ func TestEventStore_QueryEvents_TagAndKindCTE(t *testing.T) {
 		}
 	}
 
-	// Filter for chat kinds only on the same h-tag — should return only
-	// the 3 chat events, none of the 5 membership events.
 	filter := nostr.Filter{
 		Kinds: []nostr.Kind{9, 11, 12},
 		Tags:  nostr.TagMap{"h": []string{groupID}},
 	}
+
+	// SQL-shape guard: the CTE must contain the kind predicate. If a
+	// future refactor accidentally removes the kind pushdown, the
+	// result-level assertion below would still pass — this one
+	// catches the regression directly.
+	sqlText, _, err := store.buildSelectQuery(filter).ToSql()
+	if err != nil {
+		t.Fatalf("buildSelectQuery.ToSql: %v", err)
+	}
+	cteStart := strings.Index(sqlText, "WITH _tag_ids AS MATERIALIZED (")
+	cteEnd := strings.Index(sqlText, ") SELECT ")
+	if cteStart == -1 || cteEnd == -1 || cteEnd <= cteStart {
+		t.Fatalf("could not isolate CTE in generated SQL: %s", sqlText)
+	}
+	cteText := sqlText[cteStart:cteEnd]
+	if !strings.Contains(cteText, "kind") {
+		t.Errorf("CTE missing kind predicate — kind pushdown regression. CTE=%q", cteText)
+	}
+
+	// Result-level: chat-only filter excludes membership events.
 	var got []nostr.Event
 	for evt := range store.QueryEvents(filter, 100) {
 		got = append(got, evt)
 	}
-
 	if len(got) != len(chat) {
 		t.Fatalf("got %d events, want %d (chat-only)", len(got), len(chat))
 	}
