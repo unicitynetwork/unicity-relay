@@ -83,10 +83,43 @@ var (
 		Help: "Total chat messages in database",
 	}, []string{"instance"})
 
+	// Buckets cover up to the 30s dbOpTimeout (events.go) used by
+	// top-level QueryEvents callers. DefBuckets' last finite bucket is
+	// 10s, which clips percentiles in histogram_quantile for queries in
+	// the 10–30s range. Internal callers like replaceEventOnce wrap
+	// queryEventsWith with a 60s budget, so a small minority of reads
+	// can exceed 30s and land in +Inf — accepted in exchange for not
+	// growing the bucket count for an uncommon path.
+	queryDurationBuckets = []float64{
+		0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 15, 20, 30,
+	}
+
+	// QueryDuration is total wall time from query submit to last row
+	// yielded. Includes time blocked in `yield(evt)` waiting for the
+	// consumer. Kept as the historical metric so existing dashboards and
+	// alerts don't break; for diagnosing whether slowness is in Postgres
+	// or the WebSocket peer, prefer QueryDBDuration / QueryDrainDuration.
 	QueryDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "zooid_query_duration_seconds",
-		Help:    "Duration of database queries (DB execution and row scanning)",
-		Buckets: prometheus.DefBuckets,
+		Help:    "Total wall time of database queries (DB + row scan + parse + consumer drain)",
+		Buckets: queryDurationBuckets,
+	}, []string{"instance"})
+
+	// QueryDBDuration is QueryDuration minus the time blocked in
+	// `yield(evt)`. Approximates Postgres + driver + scan + parse time.
+	QueryDBDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "zooid_query_db_seconds",
+		Help:    "DB-side query time (total minus consumer drain)",
+		Buckets: queryDurationBuckets,
+	}, []string{"instance"})
+
+	// QueryDrainDuration is the time spent blocked yielding events to
+	// the consumer. High values indicate client back-pressure, not slow
+	// Postgres.
+	QueryDrainDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "zooid_query_drain_seconds",
+		Help:    "Duration spent blocked yielding query results to the consumer (back-pressure)",
+		Buckets: queryDurationBuckets,
 	}, []string{"instance"})
 )
 
@@ -106,6 +139,8 @@ func init() {
 		eventsTotal,
 		messagesTotal,
 		QueryDuration,
+		QueryDBDuration,
+		QueryDrainDuration,
 	)
 }
 

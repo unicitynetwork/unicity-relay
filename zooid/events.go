@@ -194,11 +194,16 @@ func (events *EventStore) queryEventsWith(ctx context.Context, runner squirrel.B
 			filter.Limit = maxLimit
 		}
 
-		observer := QueryDuration.With(prometheus.Labels{"instance": events.Config.Schema})
+		labels := prometheus.Labels{"instance": events.Config.Schema}
+		totalObserver := QueryDuration.With(labels)
+		dbObserver := QueryDBDuration.With(labels)
+		drainObserver := QueryDrainDuration.With(labels)
 		queryStart := time.Now()
+		var drainTotal time.Duration
+
 		rows, err := events.buildSelectQuery(filter).RunWith(runner).QueryContext(ctx)
 		if err != nil {
-			observer.Observe(time.Since(queryStart).Seconds())
+			observeQueryTimings(totalObserver, dbObserver, drainObserver, queryStart, drainTotal)
 			log.Printf("QueryEvents query error: %v", err)
 			return
 		}
@@ -245,18 +250,31 @@ func (events *EventStore) queryEventsWith(ctx context.Context, runner squirrel.B
 				continue
 			}
 
-			if !yield(evt) {
-				observer.Observe(time.Since(queryStart).Seconds())
+			yieldStart := time.Now()
+			cont := yield(evt)
+			drainTotal += time.Since(yieldStart)
+			if !cont {
+				observeQueryTimings(totalObserver, dbObserver, drainObserver, queryStart, drainTotal)
 				return
 			}
 		}
 
-		observer.Observe(time.Since(queryStart).Seconds())
+		observeQueryTimings(totalObserver, dbObserver, drainObserver, queryStart, drainTotal)
 
 		if err := rows.Err(); err != nil {
 			log.Printf("QueryEvents row iteration error: %v", err)
 		}
 	}
+}
+
+// observeQueryTimings emits the three query-duration histograms in one
+// place: total wall time, DB-side time (total - drain), and consumer-drain
+// time. Monotonic time.Since guarantees the subtraction is non-negative.
+func observeQueryTimings(total, db, drain prometheus.Observer, queryStart time.Time, drainTotal time.Duration) {
+	wall := time.Since(queryStart)
+	total.Observe(wall.Seconds())
+	db.Observe((wall - drainTotal).Seconds())
+	drain.Observe(drainTotal.Seconds())
 }
 
 func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectBuilder {

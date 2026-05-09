@@ -5,10 +5,13 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"fiatjaf.com/nostr"
 	"fiatjaf.com/nostr/khatru"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	dto "github.com/prometheus/client_model/go"
 )
 
 func createMetricsTestInstance(t *testing.T) *Instance {
@@ -340,16 +343,134 @@ func TestMetrics_QueryDurationHistogram(t *testing.T) {
 	inst := createMetricsTestInstance(t)
 
 	// Count observations before
-	before := testutil.CollectAndCount(QueryDuration)
+	beforeTotal := testutil.CollectAndCount(QueryDuration)
+	beforeDB := testutil.CollectAndCount(QueryDBDuration)
+	beforeDrain := testutil.CollectAndCount(QueryDrainDuration)
 
-	// Run a query to trigger the histogram
+	// Run a query to trigger the histograms
 	for range inst.Events.QueryEvents(nostr.Filter{Kinds: []nostr.Kind{1}}, 10) {
 	}
 
-	// The histogram should still be collectible (no panics, no errors)
-	after := testutil.CollectAndCount(QueryDuration)
-	if after < before {
-		t.Errorf("histogram metric count decreased: before=%d after=%d", before, after)
+	// All three histograms should still be collectible (no panics, no errors)
+	if afterTotal := testutil.CollectAndCount(QueryDuration); afterTotal < beforeTotal {
+		t.Errorf("QueryDuration metric count decreased: before=%d after=%d", beforeTotal, afterTotal)
+	}
+	if afterDB := testutil.CollectAndCount(QueryDBDuration); afterDB < beforeDB {
+		t.Errorf("QueryDBDuration metric count decreased: before=%d after=%d", beforeDB, afterDB)
+	}
+	if afterDrain := testutil.CollectAndCount(QueryDrainDuration); afterDrain < beforeDrain {
+		t.Errorf("QueryDrainDuration metric count decreased: before=%d after=%d", beforeDrain, afterDrain)
+	}
+}
+
+// readHistogram returns the current sample count and sum for a labeled
+// histogram child.
+func readHistogram(t *testing.T, vec *prometheus.HistogramVec, label string) (count uint64, sum float64) {
+	t.Helper()
+	m, err := vec.GetMetricWithLabelValues(label)
+	if err != nil {
+		t.Fatalf("GetMetricWithLabelValues: %v", err)
+	}
+	var pb dto.Metric
+	if err := m.(prometheus.Metric).Write(&pb); err != nil {
+		t.Fatalf("histogram.Write: %v", err)
+	}
+	h := pb.GetHistogram()
+	return h.GetSampleCount(), h.GetSampleSum()
+}
+
+// TestMetrics_QueryDrainAccounting proves that time blocked inside
+// `yield(evt)` is recorded against QueryDrainDuration and excluded from
+// QueryDBDuration. Without this split, a back-pressured WebSocket peer
+// is indistinguishable from slow Postgres in the DB metric.
+func TestMetrics_QueryDrainAccounting(t *testing.T) {
+	inst := createMetricsTestInstance(t)
+	label := inst.Config.Schema
+
+	// Insert a handful of plain text-note events under a fresh author so
+	// the query returns a known number of rows.
+	const nEvents = 5
+	sec := nostr.Generate()
+	for i := 0; i < nEvents; i++ {
+		evt := nostr.Event{
+			Kind:      1,
+			CreatedAt: nostr.Now(),
+			PubKey:    sec.Public(),
+			Tags:      nostr.Tags{},
+			Content:   fmt.Sprintf("drain-test-%d", i),
+		}
+		evt.Sign(sec)
+		if err := inst.Events.SaveEvent(evt); err != nil {
+			t.Fatalf("SaveEvent[%d]: %v", i, err)
+		}
+	}
+
+	// Snapshot the histogram counts/sums before the slow-consumer query.
+	totalCountBefore, totalSumBefore := readHistogram(t, QueryDuration, label)
+	dbCountBefore, dbSumBefore := readHistogram(t, QueryDBDuration, label)
+	drainCountBefore, drainSumBefore := readHistogram(t, QueryDrainDuration, label)
+
+	// Run the query with a consumer that sleeps per event. The sleep time
+	// should accumulate in QueryDrainDuration and be excluded from
+	// QueryDBDuration.
+	const sleepPer = 50 * time.Millisecond
+	seen := 0
+	queryStart := time.Now()
+	for range inst.Events.QueryEvents(nostr.Filter{Kinds: []nostr.Kind{1}, Authors: []nostr.PubKey{sec.Public()}}, 100) {
+		seen++
+		time.Sleep(sleepPer)
+	}
+	wall := time.Since(queryStart)
+
+	if seen != nEvents {
+		t.Fatalf("expected %d events from QueryEvents, got %d", nEvents, seen)
+	}
+
+	totalCountAfter, totalSumAfter := readHistogram(t, QueryDuration, label)
+	dbCountAfter, dbSumAfter := readHistogram(t, QueryDBDuration, label)
+	drainCountAfter, drainSumAfter := readHistogram(t, QueryDrainDuration, label)
+
+	// Exactly one observation per query on each histogram.
+	if delta := totalCountAfter - totalCountBefore; delta != 1 {
+		t.Errorf("QueryDuration sample-count delta = %d, want 1", delta)
+	}
+	if delta := dbCountAfter - dbCountBefore; delta != 1 {
+		t.Errorf("QueryDBDuration sample-count delta = %d, want 1", delta)
+	}
+	if delta := drainCountAfter - drainCountBefore; delta != 1 {
+		t.Errorf("QueryDrainDuration sample-count delta = %d, want 1", delta)
+	}
+
+	totalDelta := totalSumAfter - totalSumBefore
+	dbDelta := dbSumAfter - dbSumBefore
+	drainDelta := drainSumAfter - drainSumBefore
+
+	// Drain should account for at least 90% of the cumulative sleep —
+	// scheduler jitter can shave a little off but shouldn't cut deeper.
+	expectedDrain := float64(nEvents) * sleepPer.Seconds()
+	if drainDelta < expectedDrain*0.9 {
+		t.Errorf("drain delta = %.3fs, want >= %.3fs (~ %d × %s)",
+			drainDelta, expectedDrain*0.9, nEvents, sleepPer)
+	}
+
+	// DB time must be strictly less than the drain time — the query
+	// itself runs against an in-process testcontainer Postgres and
+	// returns 5 rows; it should be milliseconds, far below the 250ms of
+	// induced sleep.
+	if dbDelta >= drainDelta {
+		t.Errorf("dbDelta (%.3fs) should be < drainDelta (%.3fs); drain accounting may be broken",
+			dbDelta, drainDelta)
+	}
+
+	// Total = DB + drain, modulo float arithmetic. Allow 1ms tolerance.
+	if got := dbDelta + drainDelta; got < totalDelta-0.001 || got > totalDelta+0.001 {
+		t.Errorf("db (%.3fs) + drain (%.3fs) = %.3fs, want ≈ total (%.3fs)",
+			dbDelta, drainDelta, got, totalDelta)
+	}
+
+	// Sanity: total must not exceed measured wall time of the loop.
+	if totalDelta > wall.Seconds()+0.05 {
+		t.Errorf("total observation %.3fs exceeds measured wall time %.3fs", totalDelta, wall.Seconds())
 	}
 }
 
