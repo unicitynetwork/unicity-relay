@@ -4,7 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"strings"
+	"regexp"
 	"testing"
 	"time"
 
@@ -1145,22 +1145,28 @@ func TestEventStore_QueryEvents_TagAndKindCTE(t *testing.T) {
 		Tags:  nostr.TagMap{"h": []string{groupID}},
 	}
 
-	// SQL-shape guard: the CTE must contain the kind predicate. If a
-	// future refactor accidentally removes the kind pushdown, the
-	// result-level assertion below would still pass — this one
+	// SQL-shape guard: the materialized CTE must contain the kind
+	// predicate. If a future refactor accidentally removes the kind
+	// pushdown, the result-level assertion below would still pass
+	// (the outer events.kind filter does the visible work) — this
 	// catches the regression directly.
-	sqlText, _, err := store.buildSelectQuery(filter).ToSql()
+	//
+	// The regex matches MATERIALIZED, then any (lazy) content
+	// containing `kind`, then any (lazy) content up to the CTE
+	// close `)<whitespace>SELECT`. Both lazy quantifiers anchor to
+	// the closest CTE end, so an outer-only `e.kind` doesn't satisfy
+	// it (there is no `) SELECT` after the outer query's kind).
+	qb, err := store.buildSelectQuery(filter)
 	if err != nil {
-		t.Fatalf("buildSelectQuery.ToSql: %v", err)
+		t.Fatalf("buildSelectQuery: %v", err)
 	}
-	cteStart := strings.Index(sqlText, "WITH _tag_ids AS MATERIALIZED (")
-	cteEnd := strings.Index(sqlText, ") SELECT ")
-	if cteStart == -1 || cteEnd == -1 || cteEnd <= cteStart {
-		t.Fatalf("could not isolate CTE in generated SQL: %s", sqlText)
+	sqlText, _, err := qb.ToSql()
+	if err != nil {
+		t.Fatalf("ToSql: %v", err)
 	}
-	cteText := sqlText[cteStart:cteEnd]
-	if !strings.Contains(cteText, "kind") {
-		t.Errorf("CTE missing kind predicate — kind pushdown regression. CTE=%q", cteText)
+	cteWithKind := regexp.MustCompile(`(?s)MATERIALIZED.*?\bkind\b.*?\)\s+SELECT\b`)
+	if !cteWithKind.MatchString(sqlText) {
+		t.Errorf("CTE missing kind predicate — kind pushdown regression. SQL=%q", sqlText)
 	}
 
 	// Result-level: chat-only filter excludes membership events.
