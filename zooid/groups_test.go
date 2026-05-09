@@ -424,6 +424,79 @@ func TestGroupStore_WarmCaches_StaleAdminsSnapshotDoesNotOverride(t *testing.T) 
 	}
 }
 
+// TestGroupStore_IsMember_PartialWarmFallsBackToDB pins the per-group
+// fully-loaded gating in IsMember. If WarmCaches successfully loaded
+// a 39002 snapshot for one group (groupA) but didn't reach another
+// (groupB) — the partial-read failure mode that motivated #25 — then
+// IsMember(groupB, ...) must NOT trust an empty cache and must fall
+// back to the DB query path for that group. Issue #25 follow-up review.
+func TestGroupStore_IsMember_PartialWarmFallsBackToDB(t *testing.T) {
+	inst := createTestInstance()
+
+	relaySec := inst.Config.secret
+	memberA := nostr.Generate().Public()
+	memberB := nostr.Generate().Public()
+
+	mkAndSave := func(kind nostr.Kind, tags nostr.Tags) {
+		evt := nostr.Event{
+			Kind:      kind,
+			CreatedAt: nostr.Now(),
+			PubKey:    relaySec.Public(),
+			Tags:      tags,
+		}
+		evt.Sign(relaySec)
+		if err := inst.Events.SaveEvent(evt); err != nil {
+			t.Fatalf("SaveEvent(kind=%d): %v", kind, err)
+		}
+	}
+
+	// groupA has a 39002 snapshot — WarmCaches will load it and mark
+	// groupA as fully loaded.
+	mkAndSave(nostr.KindSimpleGroupMembers, nostr.Tags{
+		{"d", "groupA"},
+		{"p", memberA.Hex()},
+	})
+	// groupB has NO 39002 — simulates the partial-read failure mode
+	// (real one would be a query timeout that stopped iteration before
+	// reaching this group). But memberB's membership is recorded as a
+	// kind-9000 put-user that the DB-fallback path queries.
+	mkAndSave(nostr.KindSimpleGroupPutUser, nostr.Tags{
+		{"h", "groupB"},
+		{"p", memberB.Hex()},
+	})
+
+	// Reset and warm.
+	inst.Groups.membershipCache.Range(func(k, _ any) bool {
+		inst.Groups.membershipCache.Delete(k)
+		return true
+	})
+	inst.Groups.membershipFullyLoaded.Range(func(k, _ any) bool {
+		inst.Groups.membershipFullyLoaded.Delete(k)
+		return true
+	})
+	inst.Groups.cachesWarmed = false
+	inst.Groups.WarmCaches()
+
+	// groupA: cache authoritative. memberA in cache → true.
+	if !inst.Groups.IsMember("groupA", memberA) {
+		t.Errorf("memberA should be in cache for groupA after WarmCaches loaded its 39002 snapshot")
+	}
+	// groupA: a non-member must return false from the cache (not from
+	// a DB query). The cache is authoritative for groupA.
+	stranger := nostr.Generate().Public()
+	if inst.Groups.IsMember("groupA", stranger) {
+		t.Errorf("stranger unexpectedly reported as member of groupA")
+	}
+
+	// groupB: WarmCaches didn't load a 39002 → not in
+	// membershipFullyLoaded → IsMember falls back to DB → finds the
+	// kind-9000 put-user → returns true. This is the test that
+	// catches the partial-WarmCaches false-rejection class.
+	if !inst.Groups.IsMember("groupB", memberB) {
+		t.Errorf("memberB should be reported as member via DB fallback (groupB has a kind-9000 put-user but no 39002 was loaded by WarmCaches — partial-read mode must NOT silently false-reject)")
+	}
+}
+
 // TestGroupStore_WarmCaches_StaysPreWarmWhenSnapshotReadsEmpty pins
 // the heuristic that detects a catastrophic warm-up failure (e.g. the
 // snapshot QueryEvents calls timing out under DB pressure): if the

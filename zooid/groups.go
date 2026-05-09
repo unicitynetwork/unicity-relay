@@ -95,6 +95,15 @@ type GroupStore struct {
 	creatorCache    sync.Map // map[string]nostr.PubKey       (key = group h)
 	cachesWarmed    bool
 
+	// membershipFullyLoaded tracks groups for which WarmCaches
+	// successfully applied a kind-39002 snapshot — meaning the
+	// membershipCache holds the complete known member set for that
+	// group. IsMember consults this per group so a partial WarmCaches
+	// read (timeout mid-iteration → only some groups loaded) silently
+	// false-rejects nothing: groups not in this set fall back to the
+	// DB query path. Issue #25 follow-up review.
+	membershipFullyLoaded sync.Map // map[string]struct{} (key = group h)
+
 	// DebounceDelay coalesces rapid bursts of kind-39002 / kind-39000 rewrites
 	// for the same group into a single publish, scheduled DebounceDelay after
 	// the first scheduled trigger in a burst. NIP-29 requires republishing the
@@ -212,6 +221,11 @@ func (g *GroupStore) WarmCaches() {
 			continue
 		}
 		seenMembers[h] = k
+		// Mark this group's membership as fully loaded — IsMember
+		// consults this per-group flag and only treats the cache as
+		// authoritative when set, so a group whose 39002 didn't get
+		// read (partial scan, timeout, etc.) falls back to DB.
+		g.membershipFullyLoaded.Store(h, struct{}{})
 		ms := g.getOrCreateMemberSet(h)
 		rs := g.getOrCreateRoleSet(h)
 		ms.mu.Lock()
@@ -509,6 +523,7 @@ func (g *GroupStore) DeleteGroup(h string) {
 
 	g.metadataCache.Delete(h)
 	g.membershipCache.Delete(h)
+	g.membershipFullyLoaded.Delete(h)
 	g.roleCache.Delete(h)
 	g.creatorCache.Delete(h)
 }
@@ -604,7 +619,12 @@ func (g *GroupStore) RemoveMember(h string, pubkey nostr.PubKey) error {
 }
 
 func (g *GroupStore) IsMember(h string, pubkey nostr.PubKey) bool {
-	if g.cachesWarmed {
+	// Per-group authoritative check: only trust the cache if WarmCaches
+	// successfully loaded a kind-39002 snapshot for this group. If not
+	// (partial WarmCaches scan, group created post-restart with no
+	// snapshot yet, etc.), fall through to the DB query path. Issue
+	// #25 follow-up review.
+	if _, fullyLoaded := g.membershipFullyLoaded.Load(h); fullyLoaded {
 		if v, ok := g.membershipCache.Load(h); ok {
 			ms := v.(*memberSet)
 			ms.mu.RLock()
@@ -612,7 +632,9 @@ func (g *GroupStore) IsMember(h string, pubkey nostr.PubKey) bool {
 			ms.mu.RUnlock()
 			return found
 		}
-		return false
+		// Marked fully loaded but no cache entry — shouldn't happen
+		// because they're set together. Defensive: treat as unloaded
+		// and fall through.
 	}
 
 	filter := nostr.Filter{
@@ -623,17 +645,31 @@ func (g *GroupStore) IsMember(h string, pubkey nostr.PubKey) bool {
 		},
 	}
 
-	for event := range g.Events.QueryEvents(filter, 1) {
-		if event.Kind == nostr.KindSimpleGroupPutUser {
-			return true
+	// Walk all (typically very few) put/remove events for this
+	// (pubkey, group) pair and pick the strictly latest by
+	// (created_at, id). QueryEvents orders by created_at DESC but
+	// with no secondary tiebreak — when add+remove land in the same
+	// second (test rapid-fire, real bursts), `LIMIT 1` returns an
+	// arbitrary one and the membership decision flips run-to-run.
+	// id is the canonical event hash so bytes.Compare gives a
+	// deterministic, total tiebreak.
+	var latest nostr.Event
+	var have bool
+	for event := range g.Events.QueryEvents(filter, 0) {
+		if !have {
+			latest = event
+			have = true
+			continue
 		}
-
-		if event.Kind == nostr.KindSimpleGroupRemoveUser {
-			return false
+		if event.CreatedAt > latest.CreatedAt ||
+			(event.CreatedAt == latest.CreatedAt && bytes.Compare(event.ID[:], latest.ID[:]) > 0) {
+			latest = event
 		}
 	}
-
-	return false
+	if !have {
+		return false
+	}
+	return latest.Kind == nostr.KindSimpleGroupPutUser
 }
 
 func (g *GroupStore) GetMembers(h string) []nostr.PubKey {
@@ -726,7 +762,18 @@ func (g *GroupStore) UpdateMembersList(h string) error {
 		Tags:      tags,
 	}
 
-	return g.Events.SignAndStoreEvent(&event, true)
+	if err := g.Events.SignAndStoreEvent(&event, true); err != nil {
+		return err
+	}
+	// We just published a fresh 39002 derived from the current
+	// in-memory state, so for this group the cache IS authoritative
+	// from this point on. Mark fully loaded — IsMember can now use
+	// the cache for h instead of falling back to the DB. This also
+	// handles new groups created post-WarmCaches (CreateGroup runs
+	// AddMember + ScheduleMembersListUpdate, so by the time the
+	// snapshot lands the cache is current).
+	g.membershipFullyLoaded.Store(h, struct{}{})
+	return nil
 }
 
 // ScheduleMembersListUpdate publishes a fresh kind-39002 for h, debounced by

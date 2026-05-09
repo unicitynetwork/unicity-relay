@@ -406,11 +406,24 @@ func TestGroupMembershipCache_AddRemove(t *testing.T) {
 	pk := nostr.Generate().Public()
 
 	groups.AddMember("grp2", pk)
+	// Production calls ScheduleMembersListUpdate after AddMember (via
+	// OnEventSaved). UpdateMembersList writes a fresh 39002 from the
+	// current cache state and marks the group as fully loaded so
+	// IsMember consults the cache instead of falling back to the DB.
+	// Without this, AddMember + RemoveMember within the same second
+	// share a created_at and the DB-fallback path can't determine
+	// the latest event from the data alone.
+	if err := groups.UpdateMembersList("grp2"); err != nil {
+		t.Fatalf("UpdateMembersList: %v", err)
+	}
 	if !groups.IsMember("grp2", pk) {
 		t.Error("IsMember should return true after AddMember")
 	}
 
 	groups.RemoveMember("grp2", pk)
+	if err := groups.UpdateMembersList("grp2"); err != nil {
+		t.Fatalf("UpdateMembersList: %v", err)
+	}
 	if groups.IsMember("grp2", pk) {
 		t.Error("IsMember should return false after RemoveMember")
 	}
@@ -633,35 +646,64 @@ func TestRoleCache_WarmUpFromMembersSnapshot(t *testing.T) {
 // TestRoleCache_WarmUpRoleReplacement: now that WarmCaches reads the
 // kind-39002 members snapshot and "first wins per group" by
 // created_at DESC, the regression we want to lock in is that a stale
-// leftover snapshot (e.g. one that wasn't yet replaced by the
-// addressable-replaceable dedup) does not stomp the current state.
-// Issue #25.
+// leftover snapshot does not stomp the current state.
+//
+// IMPORTANT: We bypass SignAndStoreEvent because for addressable-
+// replaceable kinds (39002 included) it routes through ReplaceEvent,
+// which deletes any older row at write time. With both rows
+// auto-deduped the test would pass trivially without ever exercising
+// the WarmCaches first-wins logic. Signing locally and calling the
+// low-level SaveEvent forces both rows to coexist in the DB, which is
+// the actual concurrent-write race the warm-up code defends against.
+// Issue #25 follow-up review.
 func TestRoleCache_WarmUp_NewerSnapshotWins(t *testing.T) {
 	groups, _ := createTestGroupStore()
 
 	pk := nostr.Generate().Public()
+	sec := groups.Config.secret
 
 	// Older 39002: pk had the writer role.
 	oldMembers := nostr.Event{
 		Kind:      nostr.KindSimpleGroupMembers,
 		CreatedAt: nostr.Timestamp(1000),
+		PubKey:    sec.Public(),
 		Tags: nostr.Tags{
 			{"d", "replacegrp"},
 			{"p", pk.Hex(), "writer"},
 		},
 	}
-	groups.Events.SignAndStoreEvent(&oldMembers, false)
+	oldMembers.Sign(sec)
+	if err := groups.Events.SaveEvent(oldMembers); err != nil {
+		t.Fatalf("SaveEvent older snapshot: %v", err)
+	}
 
 	// Newer 39002: pk no longer has any role, but is still a member.
 	newMembers := nostr.Event{
 		Kind:      nostr.KindSimpleGroupMembers,
 		CreatedAt: nostr.Timestamp(2000),
+		PubKey:    sec.Public(),
 		Tags: nostr.Tags{
 			{"d", "replacegrp"},
 			{"p", pk.Hex()},
 		},
 	}
-	groups.Events.SignAndStoreEvent(&newMembers, false)
+	newMembers.Sign(sec)
+	if err := groups.Events.SaveEvent(newMembers); err != nil {
+		t.Fatalf("SaveEvent newer snapshot: %v", err)
+	}
+
+	// Sanity: both events must coexist in the DB. Otherwise the test
+	// is trivially passing because only the newer snapshot remains.
+	count := 0
+	for range groups.Events.QueryEvents(nostr.Filter{
+		Kinds: []nostr.Kind{nostr.KindSimpleGroupMembers},
+		Tags:  nostr.TagMap{"d": []string{"replacegrp"}},
+	}, 0) {
+		count++
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 39002 rows for replacegrp (test depends on coexistence), got %d", count)
+	}
 
 	// Fresh store and warm
 	groups2 := &GroupStore{
@@ -875,6 +917,10 @@ func TestGroupMembershipCache_DeleteClearsAll(t *testing.T) {
 	ms.mu.Lock()
 	ms.members[pk] = struct{}{}
 	ms.mu.Unlock()
+	// Mark fully loaded so IsMember trusts the cache directly (per
+	// the per-group fully-loaded gating). Otherwise IsMember would
+	// fall back to the DB and miss this directly-populated entry.
+	groups.membershipFullyLoaded.Store("delall", struct{}{})
 	groups.creatorCache.Store("delall", pk)
 
 	// Verify pre-conditions
