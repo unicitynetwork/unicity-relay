@@ -246,10 +246,10 @@ func (g *GroupStore) WarmCaches() {
 	// snapshot, surface them as a member so they don't get
 	// false-rejected by IsMember after a restart.
 	//
-	// Only honor 39001 admins as members when this 39001 is newer
-	// than the 39002 we loaded for the same group. If 39002 is newer,
-	// it's authoritative — an admin who was removed (and so dropped
-	// from the newer 39002) must not get re-added by an older 39001.
+	// Skip 39001-driven adds when the 39002 we loaded for the same
+	// group is STRICTLY newer — an admin removed by the newer 39002
+	// must not get re-added by an older 39001. Equal created_at
+	// falls through (apply) — see the per-iteration comment below.
 	seenAdmins := make(map[string]snapshotKey)
 	for event := range g.Events.QueryEvents(nostr.Filter{
 		Kinds: []nostr.Kind{nostr.KindSimpleGroupAdmins},
