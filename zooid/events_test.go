@@ -1031,3 +1031,246 @@ func TestEventStore_GetOrCreateApplicationSpecificData(t *testing.T) {
 		t.Error("GetOrCreateApplicationSpecificData() should create different event for different d tag")
 	}
 }
+
+// TestEventStore_SaveEvent_PopulatesTagKind verifies that the kind
+// denormalization on event_tags actually populates on insert. Issue #23.
+func TestEventStore_SaveEvent_PopulatesTagKind(t *testing.T) {
+	store := createTestEventStore()
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	evt := nostr.Event{
+		Kind:      9000, // a NIP-29 membership kind — the workload that motivated #23
+		CreatedAt: nostr.Now(),
+		Content:   "kind populates on insert",
+		Tags:      nostr.Tags{{"h", "general"}, {"p", "deadbeef"}},
+	}
+	evt.Sign(nostr.Generate())
+	if err := store.SaveEvent(evt); err != nil {
+		t.Fatalf("SaveEvent: %v", err)
+	}
+
+	tagsTable := store.Schema.Prefix("event_tags")
+	rows, err := GetDb().QueryContext(store.rootCtx,
+		"SELECT key, value, kind FROM "+tagsTable+" WHERE event_id = $1 ORDER BY key",
+		evt.ID.Hex())
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+
+	var got []struct {
+		key, value string
+		kind       sql.NullInt32
+	}
+	for rows.Next() {
+		var r struct {
+			key, value string
+			kind       sql.NullInt32
+		}
+		if err := rows.Scan(&r.key, &r.value, &r.kind); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got = append(got, r)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 tag rows, got %d", len(got))
+	}
+	for _, r := range got {
+		if !r.kind.Valid {
+			t.Errorf("tag (%s,%s): kind is NULL, want %d", r.key, r.value, evt.Kind)
+		} else if int(r.kind.Int32) != int(evt.Kind) {
+			t.Errorf("tag (%s,%s): kind=%d, want %d", r.key, r.value, r.kind.Int32, evt.Kind)
+		}
+	}
+}
+
+// TestEventStore_QueryEvents_TagAndKindCTE verifies the read path
+// correctly filters by tag AND kind via the materialized CTE. The
+// motivating bug: hot groups with many membership events on the same
+// h-tag dominate the CTE result, then get filtered out at hash-join
+// time. With kind pushed into the CTE, only matching-kind tag rows
+// participate. Issue #23.
+func TestEventStore_QueryEvents_TagAndKindCTE(t *testing.T) {
+	store := createTestEventStore()
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	const groupID = "general"
+	mkEvent := func(kind nostr.Kind, content string) nostr.Event {
+		evt := nostr.Event{
+			Kind:      kind,
+			CreatedAt: nostr.Now(),
+			Content:   content,
+			Tags:      nostr.Tags{{"h", groupID}},
+		}
+		evt.Sign(nostr.Generate())
+		return evt
+	}
+
+	// 3 chat messages and 5 membership events, all tagged h=general.
+	chat := []nostr.Event{
+		mkEvent(9, "msg-1"),
+		mkEvent(9, "msg-2"),
+		mkEvent(9, "msg-3"),
+	}
+	membership := []nostr.Event{
+		mkEvent(9000, "add-1"),
+		mkEvent(9000, "add-2"),
+		mkEvent(9021, "join-1"),
+		mkEvent(9021, "join-2"),
+		mkEvent(9021, "join-3"),
+	}
+	for _, evt := range append(append([]nostr.Event{}, chat...), membership...) {
+		if err := store.SaveEvent(evt); err != nil {
+			t.Fatalf("SaveEvent: %v", err)
+		}
+	}
+
+	// Filter for chat kinds only on the same h-tag — should return only
+	// the 3 chat events, none of the 5 membership events.
+	filter := nostr.Filter{
+		Kinds: []nostr.Kind{9, 11, 12},
+		Tags:  nostr.TagMap{"h": []string{groupID}},
+	}
+	var got []nostr.Event
+	for evt := range store.QueryEvents(filter, 100) {
+		got = append(got, evt)
+	}
+
+	if len(got) != len(chat) {
+		t.Fatalf("got %d events, want %d (chat-only)", len(got), len(chat))
+	}
+	for _, evt := range got {
+		if evt.Kind != 9 {
+			t.Errorf("returned event kind=%d, want 9; the kind filter leaked a membership event", evt.Kind)
+		}
+	}
+}
+
+// TestEventStore_Init_UpgradeFromPre002 simulates the production
+// upgrade path: a schema that was already initialized before
+// migration 002 existed. The `event_tags.kind` column is missing, the
+// kvstore has no row for `migration:.../002_event_tags_kind.sql`, and
+// the new code path's startup index references the column.
+//
+// Init() must:
+//  1. Defer index creation until AFTER migrations run, so the
+//     post-migrate `(key, value, kind, event_id)` index doesn't try to
+//     reference a column that doesn't exist yet.
+//  2. Apply migration 002 to add the column.
+//  3. Then create the new covering index successfully.
+//
+// This is the test that would have caught the original ordering bug
+// where the index was created in the same pre-migration block as the
+// base table.
+func TestEventStore_Init_UpgradeFromPre002(t *testing.T) {
+	store := createTestEventStore()
+
+	// Initial Init: gives us a fully-up-to-date schema.
+	if err := store.Init(); err != nil {
+		t.Fatalf("first Init: %v", err)
+	}
+
+	// Now reverse-engineer the pre-002 production state:
+	//  - drop the kind column
+	//  - drop the new covering index
+	//  - delete the kv row marking 002 as applied so migrations re-run
+	tagsTable := store.Schema.Prefix("event_tags")
+	indexName := store.Schema.Name + "__idx_event_tags_key_value_kind_event_id"
+
+	if _, err := GetDb().ExecContext(store.rootCtx, "DROP INDEX IF EXISTS "+indexName); err != nil {
+		t.Fatalf("drop index: %v", err)
+	}
+	if _, err := GetDb().ExecContext(store.rootCtx, "ALTER TABLE "+tagsTable+" DROP COLUMN IF EXISTS kind"); err != nil {
+		t.Fatalf("drop column: %v", err)
+	}
+	kvKey := fmt.Sprintf("migration:%s:002_event_tags_kind.sql", store.Schema.Name)
+	if _, err := GetDb().ExecContext(store.rootCtx, "DELETE FROM kv WHERE key = $1", kvKey); err != nil {
+		t.Fatalf("delete migration marker: %v", err)
+	}
+
+	// Sanity-check: column really is gone.
+	var hasKind bool
+	if err := GetDb().QueryRowContext(store.rootCtx,
+		"SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE LOWER(table_name)=LOWER($1) AND column_name='kind')",
+		tagsTable).Scan(&hasKind); err != nil {
+		t.Fatalf("information_schema check: %v", err)
+	}
+	if hasKind {
+		t.Fatalf("expected kind column to be dropped before upgrade test")
+	}
+
+	// Re-init: must succeed end-to-end. This is the path that errored
+	// before the fix because the new covering index was created in the
+	// pre-migration block.
+	if err := store.Init(); err != nil {
+		t.Fatalf("upgrade Init: %v", err)
+	}
+
+	// Column and index must exist after the upgrade.
+	if err := GetDb().QueryRowContext(store.rootCtx,
+		"SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE LOWER(table_name)=LOWER($1) AND column_name='kind')",
+		tagsTable).Scan(&hasKind); err != nil {
+		t.Fatalf("information_schema re-check: %v", err)
+	}
+	if !hasKind {
+		t.Errorf("kind column not added by migration 002")
+	}
+
+	var hasIndex bool
+	if err := GetDb().QueryRowContext(store.rootCtx,
+		"SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE LOWER(indexname)=LOWER($1))", indexName).Scan(&hasIndex); err != nil {
+		t.Fatalf("pg_indexes re-check: %v", err)
+	}
+	if !hasIndex {
+		t.Errorf("post-migrate index %s not created", indexName)
+	}
+}
+
+// TestEventStore_QueryEvents_TagKindNullCompat ensures the read path
+// still returns historical event_tags rows whose `kind` column is NULL
+// (the state during the backfill window after migration 002 lands but
+// before the dbops UPDATE has run). The CTE uses
+// `kind IN (...) OR kind IS NULL` to keep these rows visible. Issue #23.
+func TestEventStore_QueryEvents_TagKindNullCompat(t *testing.T) {
+	store := createTestEventStore()
+	if err := store.Init(); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	evt := nostr.Event{
+		Kind:      9,
+		CreatedAt: nostr.Now(),
+		Content:   "pretend-this-is-old",
+		Tags:      nostr.Tags{{"h", "general"}},
+	}
+	evt.Sign(nostr.Generate())
+	if err := store.SaveEvent(evt); err != nil {
+		t.Fatalf("SaveEvent: %v", err)
+	}
+
+	// Simulate an un-backfilled row: clear the kind column on the tag rows.
+	tagsTable := store.Schema.Prefix("event_tags")
+	if _, err := GetDb().ExecContext(store.rootCtx,
+		"UPDATE "+tagsTable+" SET kind = NULL WHERE event_id = $1", evt.ID.Hex()); err != nil {
+		t.Fatalf("UPDATE: %v", err)
+	}
+
+	filter := nostr.Filter{
+		Kinds: []nostr.Kind{9, 11, 12},
+		Tags:  nostr.TagMap{"h": []string{"general"}},
+	}
+	var got []nostr.Event
+	for e := range store.QueryEvents(filter, 100) {
+		got = append(got, e)
+	}
+	if len(got) != 1 {
+		t.Fatalf("got %d events with NULL-kind tag rows, want 1 (OR IS NULL fallback broken)", len(got))
+	}
+	if got[0].ID != evt.ID {
+		t.Errorf("returned wrong event")
+	}
+}
