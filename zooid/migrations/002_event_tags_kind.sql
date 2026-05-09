@@ -1,0 +1,23 @@
+-- Denormalize the event's `kind` onto event_tags so the tag-filter CTE in
+-- buildSelectQuery can pre-filter by kind via a covering index. Without
+-- this, hot groups whose tag rows are dominated by membership events
+-- (NIP-29 kinds 9000/9021) hash-join ~97k tag rows for `h='<group>'`
+-- just to throw away ~95% on the kind filter — see issue #23.
+--
+-- Migration scope:
+--   1. ADD COLUMN nullable. Instant on PG 11+ (metadata-only).
+--
+-- The matching covering index `(key, value, kind, event_id)` and the
+-- backfill of historical rows are NOT applied here:
+--   - The auto-migration runner enforces a 30s per-statement deadline,
+--     and on a busy production schema both CREATE INDEX (concurrent or
+--     not) and the bulk UPDATE can exceed that.
+--   - CREATE INDEX CONCURRENTLY cannot run inside a transaction and
+--     leaves an INVALID index on timeout, which IF NOT EXISTS would
+--     then silently skip on retry.
+--
+-- Run those two as one-shot ops via the dbops task before deploying the
+-- code change that uses the new shape — see PR description for the
+-- exact commands. Until backfill completes, the read path emits
+-- `kind IN (...) OR kind IS NULL` so historical rows still match.
+ALTER TABLE {{.Name}}__event_tags ADD COLUMN IF NOT EXISTS kind INTEGER;

@@ -86,7 +86,13 @@ type EventStore struct {
 var _ eventstore.Store = (*EventStore)(nil)
 
 func (events *EventStore) Init() error {
-	statements := []string{
+	// Statements that run BEFORE migrations: create base tables and any
+	// indexes whose definitions reference only base-table columns. The
+	// `event_tags.kind` column was introduced by migration 002, so the
+	// covering index that uses it is created later — see postMigrate
+	// below — to avoid referencing a column that doesn't exist yet on
+	// pre-002 schemas.
+	preMigrate := []string{
 		events.Schema.Render(`
 			CREATE TABLE IF NOT EXISTS {{.Name}}__events (
 				id TEXT PRIMARY KEY,
@@ -107,6 +113,7 @@ func (events *EventStore) Init() error {
 				event_id TEXT NOT NULL,
 				key TEXT NOT NULL,
 				value TEXT NOT NULL,
+				kind INTEGER,
 				FOREIGN KEY (event_id) REFERENCES {{.Name}}__events(id) ON DELETE CASCADE
 			)`),
 		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_event_tags_event_id ON {{.Name}}__event_tags(event_id)`),
@@ -116,7 +123,7 @@ func (events *EventStore) Init() error {
 		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_events_kind_created_at ON {{.Name}}__events(kind, created_at DESC)`),
 	}
 
-	for _, stmt := range statements {
+	for _, stmt := range preMigrate {
 		if _, err := GetDb().ExecContext(events.rootCtx, stmt); err != nil {
 			return fmt.Errorf("schema init failed: %w", err)
 		}
@@ -128,6 +135,17 @@ func (events *EventStore) Init() error {
 
 	if err := RunMigrations(events.rootCtx, events.Schema); err != nil {
 		return fmt.Errorf("migrations failed: %w", err)
+	}
+
+	// Statements that depend on columns added by migrations.
+	postMigrate := []string{
+		events.Schema.Render(`CREATE INDEX IF NOT EXISTS {{.Name}}__idx_event_tags_key_value_kind_event_id ON {{.Name}}__event_tags(key, value, kind, event_id)`),
+	}
+
+	for _, stmt := range postMigrate {
+		if _, err := GetDb().ExecContext(events.rootCtx, stmt); err != nil {
+			return fmt.Errorf("schema init (post-migrate) failed: %w", err)
+		}
 	}
 
 	return nil
@@ -322,6 +340,20 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectB
 	if len(tagFilters) > 0 {
 		col = "e."
 
+		// Pre-compute the kind values once so each tag CTE branch can
+		// push them down via the (key, value, kind, event_id) covering
+		// index. Critical for hot groups whose tag rows are dominated by
+		// membership events (kinds 9000/9021): without this, a query for
+		// chat kinds (9, 11, 12) on h='general' hash-joins ~97k tag rows
+		// just to throw away the ~95k membership ones (issue #23).
+		var kindInts []interface{}
+		if len(filter.Kinds) > 0 {
+			kindInts = make([]interface{}, len(filter.Kinds))
+			for i, k := range filter.Kinds {
+				kindInts[i] = int(k)
+			}
+		}
+
 		// Build one SELECT per tag filter, INTERSECT them for AND logic.
 		var cteParts []string
 		var cteArgs []interface{}
@@ -330,6 +362,16 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectB
 				From(eventTagsTable).
 				Where(squirrel.Eq{"key": tf.key}).
 				Where(squirrel.Eq{"value": tf.values})
+			if len(kindInts) > 0 {
+				// `kind IS NULL` keeps reads correct for un-backfilled
+				// rows (event_tags.kind is added nullable; backfill is a
+				// separate ops step). Drop the IS NULL branch in a
+				// follow-up once the backfill is verified complete.
+				subQ = subQ.Where(squirrel.Or{
+					squirrel.Eq{"kind": kindInts},
+					squirrel.Expr("kind IS NULL"),
+				})
+			}
 			sql, args, _ := subQ.ToSql()
 			cteParts = append(cteParts, sql)
 			cteArgs = append(cteArgs, args...)
@@ -496,30 +538,37 @@ func (events *EventStore) saveEventWith(ctx context.Context, runner squirrel.Bas
 	}
 
 	// Insert single-letter tags into event_tags, chunked to stay below
-	// Postgres's 65535 extended-protocol parameter limit. With 3 columns per
-	// row, 15000 rows × 3 = 45000 params is well under the 65535 cap and
-	// cuts the inner round-trip count by ~3× vs. 5k batches — important for
-	// kind-39002 (NIP-29 member list) saves where the whole transaction runs
-	// under SERIALIZABLE isolation and contention is dominated by wall-clock
-	// duration of the critical section (issues #13, #16).
+	// Postgres's 65535 extended-protocol parameter limit. With 4 columns
+	// per row (event_id, key, value, kind), 15000 rows × 4 = 60000 params
+	// stays under the 65535 cap and matches the round-trip economy that
+	// matters most for kind-39002 (NIP-29 member list) saves — those run
+	// under SERIALIZABLE isolation and contention is dominated by the
+	// wall-clock duration of the critical section (issues #13, #16). If
+	// another column is ever added here the batch size must drop.
 	const tagInsertBatchSize = 15000
 
 	eventID := evt.ID.Hex()
+	eventKind := int(evt.Kind)
 	tagsTable := events.Schema.Prefix("event_tags")
-	batch := sb.Insert(tagsTable).Columns("event_id", "key", "value")
+	// kind is denormalized here so the tag-filter CTE in buildSelectQuery
+	// can pre-filter by kind via the (key, value, kind, event_id) covering
+	// index — without it, hot groups whose tag-rows are dominated by
+	// membership events (kinds 9000/9021) hash-join 90k+ rows just to throw
+	// 95% of them away on the kind filter. See zooid issue #23.
+	batch := sb.Insert(tagsTable).Columns("event_id", "key", "value", "kind")
 	n := 0
 
 	for _, tag := range evt.Tags {
 		if len(tag) < 2 || len(tag[0]) != 1 {
 			continue
 		}
-		batch = batch.Values(eventID, tag[0], tag[1])
+		batch = batch.Values(eventID, tag[0], tag[1], eventKind)
 		n++
 		if n >= tagInsertBatchSize {
 			if _, err := batch.RunWith(runner).ExecContext(ctx); err != nil {
 				return fmt.Errorf("failed to save tags for event '%s': %w", evt.ID, err)
 			}
-			batch = sb.Insert(tagsTable).Columns("event_id", "key", "value")
+			batch = sb.Insert(tagsTable).Columns("event_id", "key", "value", "kind")
 			n = 0
 		}
 	}
