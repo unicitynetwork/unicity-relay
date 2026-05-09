@@ -304,8 +304,9 @@ func TestGroupStore_WarmCaches_FromMembersSnapshot(t *testing.T) {
 	relaySec := inst.Config.secret
 	memberA := nostr.Generate().Public()
 	memberB := nostr.Generate().Public()
-	adminPK := nostr.Generate().Public()
-	tailMember := nostr.Generate().Public() // post-snapshot put
+	writerPK := nostr.Generate().Public()    // member with role on 39002
+	adminOnlyPK := nostr.Generate().Public() // present in 39001 but not 39002 — must still be a member
+	tailMember := nostr.Generate().Public()  // post-snapshot put
 
 	mkAndSave := func(kind nostr.Kind, tags nostr.Tags) {
 		evt := nostr.Event{
@@ -320,28 +321,31 @@ func TestGroupStore_WarmCaches_FromMembersSnapshot(t *testing.T) {
 		}
 	}
 
-	// Snapshot of members: A and B.
+	// kind-39002 (members) — UpdateMembersList shape: roles ride on
+	// the per-member p-tag at positions 2+.
 	mkAndSave(nostr.KindSimpleGroupMembers, nostr.Tags{
 		{"d", groupID},
 		{"p", memberA.Hex()},
 		{"p", memberB.Hex()},
+		{"p", writerPK.Hex(), "writer"},
 	})
-	// Snapshot of admins: adminPK with role "admin".
+	// kind-39001 (admins) — UpdateAdminsList shape: just `{p, pubkey}`,
+	// no role positions. WarmCaches uses this only to ensure listed
+	// admins are visible as members even if the 39002 snapshot is
+	// stale and missed them.
 	mkAndSave(nostr.KindSimpleGroupAdmins, nostr.Tags{
 		{"d", groupID},
-		{"p", adminPK.Hex(), "admin"},
+		{"p", adminOnlyPK.Hex()},
 	})
 	// Tail-of-log put-user that the snapshot doesn't cover yet.
-	// Real post-startup live updates would pull this in via the event
+	// Live updates post-startup would pull this in via the event
 	// handler; warm-up should NOT see it.
 	mkAndSave(nostr.KindSimpleGroupPutUser, nostr.Tags{
 		{"h", groupID},
 		{"p", tailMember.Hex()},
 	})
 
-	// Re-warm caches against the just-saved fixtures. createTestInstance
-	// already called WarmCaches before our SaveEvents, so we need to
-	// reset the relevant caches and call it again.
+	// Re-warm caches against the just-saved fixtures.
 	inst.Groups.membershipCache.Delete(groupID)
 	inst.Groups.roleCache.Delete(groupID)
 	inst.Groups.cachesWarmed = false
@@ -353,10 +357,16 @@ func TestGroupStore_WarmCaches_FromMembersSnapshot(t *testing.T) {
 	if !inst.Groups.IsMember(groupID, memberB) {
 		t.Errorf("memberB missing from cache")
 	}
+	if !inst.Groups.IsMember(groupID, writerPK) {
+		t.Errorf("writerPK missing from cache; should have been loaded from kind-39002")
+	}
+	if !inst.Groups.HasRole(groupID, writerPK, "writer") {
+		t.Errorf("writerPK role missing; roles ride on kind-39002 p-tag positions 2+")
+	}
+	if !inst.Groups.IsMember(groupID, adminOnlyPK) {
+		t.Errorf("adminOnlyPK missing from cache; admins listed in kind-39001 are implicitly members and must be surfaced even if the 39002 snapshot didn't list them")
+	}
 	if inst.Groups.IsMember(groupID, tailMember) {
 		t.Errorf("tailMember unexpectedly in cache; warm-up should read snapshots only, not tail of put/remove log")
-	}
-	if !inst.Groups.HasRole(groupID, adminPK, "admin") {
-		t.Errorf("adminPK role missing from cache; should have been loaded from kind-39001")
 	}
 }

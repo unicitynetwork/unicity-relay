@@ -181,6 +181,12 @@ func (g *GroupStore) WarmCaches() {
 	// addressable-replaceable keyed by d-tag; the relay normally keeps
 	// only one per group. We still defend against duplicates here so a
 	// stale leftover doesn't stomp the current state.
+	//
+	// In this codebase the **roles live on kind-39002**, not 39001 —
+	// see UpdateMembersList: the per-member p-tag is
+	// `{"p", pubkey, role1, role2, ...}`. UpdateAdminsList emits
+	// `{"p", pubkey}` only. So the members snapshot drives both the
+	// membership and the role caches.
 	seenMembers := make(map[string]struct{})
 	for event := range g.Events.QueryEvents(nostr.Filter{
 		Kinds: []nostr.Kind{nostr.KindSimpleGroupMembers},
@@ -194,15 +200,34 @@ func (g *GroupStore) WarmCaches() {
 		}
 		seenMembers[h] = struct{}{}
 		ms := g.getOrCreateMemberSet(h)
+		rs := g.getOrCreateRoleSet(h)
 		ms.mu.Lock()
+		rs.mu.Lock()
 		for tag := range event.Tags.FindAll("p") {
-			if pubkey, err := nostr.PubKeyFromHex(tag[1]); err == nil {
-				ms.members[pubkey] = struct{}{}
+			if len(tag) < 2 {
+				continue
+			}
+			pubkey, err := nostr.PubKeyFromHex(tag[1])
+			if err != nil {
+				continue
+			}
+			ms.members[pubkey] = struct{}{}
+			if len(tag) > 2 {
+				roles := make(map[string]struct{}, len(tag)-2)
+				for i := 2; i < len(tag); i++ {
+					roles[tag[i]] = struct{}{}
+				}
+				rs.roles[pubkey] = roles
 			}
 		}
+		rs.mu.Unlock()
 		ms.mu.Unlock()
 	}
 
+	// Belt-and-suspenders: admins per NIP-29 are implicitly members.
+	// If a 39001 lists a pubkey that's missing from a possibly-stale
+	// 39002 snapshot, surface them as a member so they don't get
+	// false-rejected by IsMember after a restart.
 	seenAdmins := make(map[string]struct{})
 	for event := range g.Events.QueryEvents(nostr.Filter{
 		Kinds: []nostr.Kind{nostr.KindSimpleGroupAdmins},
@@ -215,23 +240,17 @@ func (g *GroupStore) WarmCaches() {
 			continue
 		}
 		seenAdmins[h] = struct{}{}
-		rs := g.getOrCreateRoleSet(h)
-		rs.mu.Lock()
+		ms := g.getOrCreateMemberSet(h)
+		ms.mu.Lock()
 		for tag := range event.Tags.FindAll("p") {
-			pubkey, err := nostr.PubKeyFromHex(tag[1])
-			if err != nil {
+			if len(tag) < 2 {
 				continue
 			}
-			// p-tag positions 2+ are roles per NIP-29.
-			if len(tag) > 2 {
-				roles := make(map[string]struct{}, len(tag)-2)
-				for i := 2; i < len(tag); i++ {
-					roles[tag[i]] = struct{}{}
-				}
-				rs.roles[pubkey] = roles
+			if pubkey, err := nostr.PubKeyFromHex(tag[1]); err == nil {
+				ms.members[pubkey] = struct{}{}
 			}
 		}
-		rs.mu.Unlock()
+		ms.mu.Unlock()
 	}
 
 	// Self-heal: regenerate metadata for groups that have a creation event but
