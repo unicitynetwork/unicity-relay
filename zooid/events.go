@@ -322,6 +322,18 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectB
 		return tagFilters[i].key < tagFilters[j].key
 	})
 
+	// Pre-compute filter.Kinds once. Used both inside the tag CTE (to
+	// push kind into the (key, value, kind, event_id) covering index —
+	// critical for hot groups whose tag rows are dominated by membership
+	// events, see issue #23) and on the outer events query.
+	var kindInts []interface{}
+	if len(filter.Kinds) > 0 {
+		kindInts = make([]interface{}, len(filter.Kinds))
+		for i, k := range filter.Kinds {
+			kindInts[i] = int(k)
+		}
+	}
+
 	// When tag filters are present, use a materialized CTE to force the
 	// planner to resolve tag lookups FIRST via the covering index, then
 	// join the small result set to events.
@@ -339,20 +351,6 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectB
 
 	if len(tagFilters) > 0 {
 		col = "e."
-
-		// Pre-compute the kind values once so each tag CTE branch can
-		// push them down via the (key, value, kind, event_id) covering
-		// index. Critical for hot groups whose tag rows are dominated by
-		// membership events (kinds 9000/9021): without this, a query for
-		// chat kinds (9, 11, 12) on h='general' hash-joins ~97k tag rows
-		// just to throw away the ~95k membership ones (issue #23).
-		var kindInts []interface{}
-		if len(filter.Kinds) > 0 {
-			kindInts = make([]interface{}, len(filter.Kinds))
-			for i, k := range filter.Kinds {
-				kindInts[i] = int(k)
-			}
-		}
 
 		// Build one SELECT per tag filter, INTERSECT them for AND logic.
 		var cteParts []string
@@ -372,7 +370,15 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectB
 					squirrel.Expr("kind IS NULL"),
 				})
 			}
-			sql, args, _ := subQ.ToSql()
+			sql, args, err := subQ.ToSql()
+			if err != nil {
+				// squirrel.Select.ToSql only fails for malformed builder
+				// state (unset column lists, etc.) — programmer error,
+				// not user input. Panic so it's caught loudly in tests
+				// rather than silently appending an empty string and
+				// corrupting the CTE.
+				panic(fmt.Errorf("buildSelectQuery: tag CTE ToSql: %w", err))
+			}
 			cteParts = append(cteParts, sql)
 			cteArgs = append(cteArgs, args...)
 		}
@@ -412,11 +418,7 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) squirrel.SelectB
 		qb = qb.Where(squirrel.Eq{col + "pubkey": authorStrs})
 	}
 
-	if len(filter.Kinds) > 0 {
-		kindInts := make([]interface{}, len(filter.Kinds))
-		for i, kind := range filter.Kinds {
-			kindInts[i] = int(kind)
-		}
+	if len(kindInts) > 0 {
 		qb = qb.Where(squirrel.Eq{col + "kind": kindInts})
 	}
 

@@ -4,20 +4,19 @@
 -- (NIP-29 kinds 9000/9021) hash-join ~97k tag rows for `h='<group>'`
 -- just to throw away ~95% on the kind filter — see issue #23.
 --
--- Migration scope:
---   1. ADD COLUMN nullable. Instant on PG 11+ (metadata-only).
+-- Migration scope is just ADD COLUMN (instant, metadata-only on PG 11+).
+-- The matching covering index `(key, value, kind, event_id)` is created
+-- by Init() in the post-migrate phase via CREATE INDEX IF NOT EXISTS,
+-- which is fast on fresh/dev schemas (empty or tiny event_tags) but on
+-- a populated production schema would hold a SHARE lock on event_tags
+-- for the duration of the build. The backfill of historical rows is
+-- not in this file at all.
 --
--- The matching covering index `(key, value, kind, event_id)` and the
--- backfill of historical rows are NOT applied here:
---   - The auto-migration runner enforces a 30s per-statement deadline,
---     and on a busy production schema both CREATE INDEX (concurrent or
---     not) and the bulk UPDATE can exceed that.
---   - CREATE INDEX CONCURRENTLY cannot run inside a transaction and
---     leaves an INVALID index on timeout, which IF NOT EXISTS would
---     then silently skip on retry.
---
--- Run those two as one-shot ops via the dbops task before deploying the
--- code change that uses the new shape — see PR description for the
--- exact commands. Until backfill completes, the read path emits
--- `kind IN (...) OR kind IS NULL` so historical rows still match.
+-- Production rollout therefore expects two one-shot ops via the dbops
+-- task BEFORE this code is deployed: a backfill UPDATE setting kind on
+-- existing rows, and a CREATE INDEX CONCURRENTLY IF NOT EXISTS for the
+-- new covering index. Exact commands are in the PR description for
+-- issue #23. Until the backfill is verified complete, the read path
+-- emits `kind IN (...) OR kind IS NULL` so un-backfilled rows still
+-- match.
 ALTER TABLE {{.Name}}__event_tags ADD COLUMN IF NOT EXISTS kind INTEGER;
