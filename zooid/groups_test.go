@@ -366,8 +366,82 @@ func TestGroupStore_WarmCaches_FromMembersSnapshot(t *testing.T) {
 	if !inst.Groups.IsMember(groupID, adminOnlyPK) {
 		t.Errorf("adminOnlyPK missing from cache; admins listed in kind-39001 are implicitly members and must be surfaced even if the 39002 snapshot didn't list them")
 	}
-	if inst.Groups.IsMember(groupID, tailMember) {
-		t.Errorf("tailMember unexpectedly in cache; warm-up should read snapshots only, not tail of put/remove log")
+	// tailMember was added via a kind-9000 saved with nostr.Now(),
+	// the snapshots also use nostr.Now(). With the lag-window-closure
+	// tail-of-log read, events strictly after the snapshot get
+	// applied. In this test the timestamps coincide (same second),
+	// so tailMember is on the boundary — accept either outcome.
+	// The dedicated TestGroupStore_WarmCaches_TailReplaysPostSnapshot
+	// pins the strictly-newer case.
+}
+
+// TestGroupStore_WarmCaches_TailReplaysPostSnapshot verifies the
+// lag-window-closure tail-of-log read in WarmCaches: kind-9000 / 9001
+// events with created_at strictly newer than a group's 39002 snapshot
+// must be applied to the cache during warm-up. Without this, members
+// added (or removed) between the last snapshot emission and a relay
+// restart would stay missing (or stuck) in the cache indefinitely —
+// the live event handler doesn't replay them. Issue #25 follow-up
+// review.
+func TestGroupStore_WarmCaches_TailReplaysPostSnapshot(t *testing.T) {
+	inst := createTestInstance()
+	const groupID = "tailgrp"
+
+	relaySec := inst.Config.secret
+	snapshotMember := nostr.Generate().Public()
+	addedAfterSnapshot := nostr.Generate().Public()
+	removedAfterSnapshot := nostr.Generate().Public()
+
+	mkAndSave := func(kind nostr.Kind, ts nostr.Timestamp, tags nostr.Tags) {
+		evt := nostr.Event{
+			Kind:      kind,
+			CreatedAt: ts,
+			PubKey:    relaySec.Public(),
+			Tags:      tags,
+		}
+		evt.Sign(relaySec)
+		if err := inst.Events.SaveEvent(evt); err != nil {
+			t.Fatalf("SaveEvent(kind=%d): %v", kind, err)
+		}
+	}
+
+	// Snapshot at t=1000 with snapshotMember and removedAfterSnapshot
+	// (the latter will be removed in the tail).
+	mkAndSave(nostr.KindSimpleGroupMembers, nostr.Timestamp(1000), nostr.Tags{
+		{"d", groupID},
+		{"p", snapshotMember.Hex()},
+		{"p", removedAfterSnapshot.Hex()},
+	})
+	// Tail: post-snapshot kind-9000 adding addedAfterSnapshot.
+	mkAndSave(nostr.KindSimpleGroupPutUser, nostr.Timestamp(2000), nostr.Tags{
+		{"h", groupID},
+		{"p", addedAfterSnapshot.Hex()},
+	})
+	// Tail: post-snapshot kind-9001 removing removedAfterSnapshot.
+	mkAndSave(nostr.KindSimpleGroupRemoveUser, nostr.Timestamp(2500), nostr.Tags{
+		{"h", groupID},
+		{"p", removedAfterSnapshot.Hex()},
+	})
+
+	inst.Groups.membershipCache.Range(func(k, _ any) bool {
+		inst.Groups.membershipCache.Delete(k)
+		return true
+	})
+	inst.Groups.membershipFullyLoaded.Range(func(k, _ any) bool {
+		inst.Groups.membershipFullyLoaded.Delete(k)
+		return true
+	})
+	inst.Groups.cachesWarmed = false
+	inst.Groups.WarmCaches()
+
+	if !inst.Groups.IsMember(groupID, snapshotMember) {
+		t.Errorf("snapshotMember missing — should be loaded from kind-39002")
+	}
+	if !inst.Groups.IsMember(groupID, addedAfterSnapshot) {
+		t.Errorf("addedAfterSnapshot missing — kind-9000 newer than the 39002 snapshot must be applied during the tail-of-log read")
+	}
+	if inst.Groups.IsMember(groupID, removedAfterSnapshot) {
+		t.Errorf("removedAfterSnapshot still in cache — kind-9001 newer than the 39002 snapshot must be applied during the tail-of-log read")
 	}
 }
 

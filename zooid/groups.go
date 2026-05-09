@@ -186,10 +186,12 @@ func (g *GroupStore) WarmCaches() {
 	// positions — and is read here only as a defensive safety net so an
 	// admin missing from a stale 39002 still surfaces as a member.
 	//
-	// Lag window: any change made between the last snapshot emission for
-	// a group and a restart is missed by this rebuild. The live event
-	// handler in groups.go updates the cache on each new kind-9000/9001
-	// going forward, so the gap closes naturally as those events arrive.
+	// Lag window closure: after applying snapshots, we read the tail of
+	// the kind-9000/9001 log since the OLDEST snapshot's created_at and
+	// re-apply any per-group events the snapshot didn't cover. Without
+	// this, membership changes that happened after a group's last 39002
+	// emission but before the relay restart stay missing from the cache
+	// indefinitely (the live handler doesn't replay them on its own).
 	// QueryEvents returns events ordered by created_at DESC. We
 	// dedupe per group with an explicit (created_at, id) tiebreaker
 	// because two concurrent ReplaceEvent calls can race past the
@@ -298,6 +300,71 @@ func (g *GroupStore) WarmCaches() {
 			}
 		}
 		ms.mu.Unlock()
+	}
+
+	// Tail-of-log read: replay any kind-9000/9001 events the
+	// snapshots didn't cover (events emitted after a group's last
+	// 39002 but before this restart). Without this, those membership
+	// changes stay missing from the cache and IsMember would
+	// false-reject the affected members until a new 39002 happens to
+	// be emitted for that group on the next change.
+	//
+	// We bound the tail by `Since = oldest 39002 created_at across
+	// all loaded groups`, then per-event we apply the change ONLY if
+	// the event is strictly newer than that group's snapshot. So old
+	// events covered by their group's snapshot are skipped per-row,
+	// and groups without a snapshot are skipped entirely (their
+	// membership stays under DB-fallback via IsMember). This keeps
+	// the tail size proportional to time-since-newest-snapshot
+	// (typically seconds-to-minutes thanks to the debounced 39002
+	// emission pipeline), not to total membership history.
+	if len(seenMembers) > 0 {
+		oldest := nostr.Timestamp(0)
+		first := true
+		for _, k := range seenMembers {
+			if first || k.createdAt < oldest {
+				oldest = k.createdAt
+				first = false
+			}
+		}
+		// QueryEvents returns DESC; replaying put/remove DESC gives
+		// the wrong final state when an Add+Remove pair lands in
+		// the tail (the remove fires against an empty set, then the
+		// add re-introduces the user). Collect and reverse to
+		// process oldest-first.
+		tail := slices.Collect(g.Events.QueryEvents(nostr.Filter{
+			Kinds: []nostr.Kind{nostr.KindSimpleGroupPutUser, nostr.KindSimpleGroupRemoveUser},
+			Since: oldest,
+		}, 0))
+		for _, event := range Reversed(tail) {
+			h := GetGroupIDFromEvent(event)
+			if h == "" {
+				continue
+			}
+			snap, hasSnap := seenMembers[h]
+			if !hasSnap || event.CreatedAt <= snap.createdAt {
+				// No snapshot for this group → leave it for DB
+				// fallback. Or event already covered by snapshot.
+				continue
+			}
+			ms := g.getOrCreateMemberSet(h)
+			ms.mu.Lock()
+			for tag := range event.Tags.FindAll("p") {
+				if len(tag) < 2 {
+					continue
+				}
+				pubkey, err := nostr.PubKeyFromHex(tag[1])
+				if err != nil {
+					continue
+				}
+				if event.Kind == nostr.KindSimpleGroupPutUser {
+					ms.members[pubkey] = struct{}{}
+				} else {
+					delete(ms.members, pubkey)
+				}
+			}
+			ms.mu.Unlock()
+		}
 	}
 
 	// Self-heal: regenerate metadata for groups that have a creation event but
