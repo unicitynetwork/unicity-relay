@@ -194,10 +194,11 @@ func (events *EventStore) queryEventsWith(ctx context.Context, runner squirrel.B
 			filter.Limit = maxLimit
 		}
 
-		labels := prometheus.Labels{"instance": events.Config.Schema}
-		totalObserver := QueryDuration.With(labels)
-		dbObserver := QueryDBDuration.With(labels)
-		drainObserver := QueryDrainDuration.With(labels)
+		// WithLabelValues avoids the map allocation that With(Labels{...})
+		// does on every call — this is the per-query hot path.
+		totalObserver := QueryDuration.WithLabelValues(events.Config.Schema)
+		dbObserver := QueryDBDuration.WithLabelValues(events.Config.Schema)
+		drainObserver := QueryDrainDuration.WithLabelValues(events.Config.Schema)
 		queryStart := time.Now()
 		var drainTotal time.Duration
 
@@ -269,7 +270,9 @@ func (events *EventStore) queryEventsWith(ctx context.Context, runner squirrel.B
 
 // observeQueryTimings emits the three query-duration histograms in one
 // place: total wall time, DB-side time (total - drain), and consumer-drain
-// time. Monotonic time.Since guarantees the subtraction is non-negative.
+// time. (wall - drainTotal) is non-negative because drainTotal is the sum
+// of disjoint sub-intervals of the overall query wall time — yields run
+// sequentially inside the iter.Seq, never concurrently.
 func observeQueryTimings(total, db, drain prometheus.Observer, queryStart time.Time, drainTotal time.Duration) {
 	wall := time.Since(queryStart)
 	total.Observe(wall.Seconds())
