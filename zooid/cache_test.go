@@ -408,8 +408,11 @@ func TestGroupMembershipCache_AddRemove(t *testing.T) {
 	// Mark grp2 as fully loaded for the test. Production sets this
 	// in OnEventSaved for kind-9007 (new group creation), but this
 	// artificial test bypasses that flow. Without the marker
-	// IsMember falls back to the DB, which can't deterministically
-	// order Add+Remove events that share a second's created_at.
+	// IsMember would fall back to the DB-query path, which would
+	// still resolve correctly (the DB-fallback uses the
+	// `(created_at, id)` tiebreak now) but tying the assertion to
+	// the cache path is more direct: this test is about Add/Remove
+	// updating the in-memory cache, not the DB-fallback semantics.
 	groups.membershipFullyLoaded.Store("grp2", struct{}{})
 
 	groups.AddMember("grp2", pk)

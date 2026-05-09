@@ -342,13 +342,25 @@ func (g *GroupStore) WarmCaches() {
 				continue
 			}
 			snap, hasSnap := seenMembers[h]
-			if !hasSnap || event.CreatedAt <= snap.createdAt {
+			if !hasSnap {
 				// No snapshot for this group → leave it for DB
-				// fallback. Or event already covered by snapshot.
+				// fallback via IsMember.
+				continue
+			}
+			// Strictly-newer-than-snapshot via the same
+			// (created_at, id) tiebreak used elsewhere. nostr
+			// timestamps are second-resolution, so plain `<=`
+			// drops events emitted in the same second as the
+			// snapshot — and those are exactly the changes the
+			// snapshot pipeline's debounce makes most likely.
+			eventKey := snapshotKey{createdAt: event.CreatedAt, id: event.ID}
+			if !newer(eventKey, snap) {
 				continue
 			}
 			ms := g.getOrCreateMemberSet(h)
+			rs := g.getOrCreateRoleSet(h)
 			ms.mu.Lock()
+			rs.mu.Lock()
 			for tag := range event.Tags.FindAll("p") {
 				if len(tag) < 2 {
 					continue
@@ -359,10 +371,29 @@ func (g *GroupStore) WarmCaches() {
 				}
 				if event.Kind == nostr.KindSimpleGroupPutUser {
 					ms.members[pubkey] = struct{}{}
+					// PutUser carries roles at p-tag positions 2+
+					// (NIP-29). Apply them so a role
+					// granted/cleared post-snapshot doesn't get
+					// silently lost from rs.roles. AddMember
+					// (the cache-update path) clears roles on
+					// each call, so do the same here: replace
+					// the role set if positions 2+ exist, drop
+					// it otherwise.
+					if len(tag) > 2 {
+						roles := make(map[string]struct{}, len(tag)-2)
+						for i := 2; i < len(tag); i++ {
+							roles[tag[i]] = struct{}{}
+						}
+						rs.roles[pubkey] = roles
+					} else {
+						delete(rs.roles, pubkey)
+					}
 				} else {
 					delete(ms.members, pubkey)
+					delete(rs.roles, pubkey)
 				}
 			}
+			rs.mu.Unlock()
 			ms.mu.Unlock()
 		}
 	}
@@ -793,6 +824,23 @@ func (g *GroupStore) GetMemberCount(h string) int {
 }
 
 func (g *GroupStore) UpdateMembersList(h string) error {
+	// Refuse to publish a snapshot when the in-memory membership for
+	// this group isn't authoritative (e.g. WarmCaches missed its 39002
+	// because of a partial scan). GetMembers gates on the global
+	// cachesWarmed flag and returns an empty list if no cache entry
+	// exists, so without this guard we'd clobber the existing on-disk
+	// 39002 with an empty / partial member list — every subsequent
+	// restart's WarmCaches would load that bad snapshot. Issue #25.
+	//
+	// The next successful WarmCaches will reload the existing 39002
+	// and mark the group fully loaded; the live event handler keeps
+	// the cache in sync from there, and later UpdateMembersList calls
+	// can resume publishing.
+	if _, fullyLoaded := g.membershipFullyLoaded.Load(h); !fullyLoaded {
+		log.Printf("UpdateMembersList: skipping group %q — cache not fully loaded; refusing to publish potentially-partial 39002", h)
+		return nil
+	}
+
 	tags := nostr.Tags{
 		nostr.Tag{"-"},
 		nostr.Tag{"d", h},

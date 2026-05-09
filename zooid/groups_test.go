@@ -273,9 +273,12 @@ func TestGroupStore_ScheduleRewrite_RerunIfDirtyDuringRun(t *testing.T) {
 // returns its error directly.
 func TestGroupStore_ScheduleMembersList_SyncWhenDelayZero(t *testing.T) {
 	g := &GroupStore{DebounceDelay: 0}
-	// No Events store wired up: UpdateMembersList will reach SignAndStoreEvent
-	// and panic. We only assert that scheduling delegates synchronously,
-	// proven by the panic propagating to this goroutine.
+	// UpdateMembersList early-returns for groups whose membership
+	// isn't fully loaded (issue #25 follow-up); mark g1 so the call
+	// proceeds to SignAndStoreEvent and panics on the nil Events.
+	// The panic propagating to this goroutine is what proves the
+	// schedule delegates synchronously.
+	g.membershipFullyLoaded.Store("g1", struct{}{})
 	defer func() {
 		if r := recover(); r == nil {
 			t.Error("expected synchronous call to panic from nil Events; got no panic")
@@ -306,12 +309,15 @@ func TestGroupStore_WarmCaches_FromMembersSnapshot(t *testing.T) {
 	memberB := nostr.Generate().Public()
 	writerPK := nostr.Generate().Public()    // member with role on 39002
 	adminOnlyPK := nostr.Generate().Public() // present in 39001 but not 39002 — must still be a member
-	tailMember := nostr.Generate().Public()  // post-snapshot put
 
-	mkAndSave := func(kind nostr.Kind, tags nostr.Tags) {
+	// Explicit timestamps so the (created_at, id) tiebreak in the
+	// tail-of-log read isn't decided by random id ordering.
+	const snapshotTS = nostr.Timestamp(2000)
+
+	mkAndSave := func(kind nostr.Kind, ts nostr.Timestamp, tags nostr.Tags) {
 		evt := nostr.Event{
 			Kind:      kind,
-			CreatedAt: nostr.Now(),
+			CreatedAt: ts,
 			PubKey:    relaySec.Public(),
 			Tags:      tags,
 		}
@@ -323,7 +329,7 @@ func TestGroupStore_WarmCaches_FromMembersSnapshot(t *testing.T) {
 
 	// kind-39002 (members) — UpdateMembersList shape: roles ride on
 	// the per-member p-tag at positions 2+.
-	mkAndSave(nostr.KindSimpleGroupMembers, nostr.Tags{
+	mkAndSave(nostr.KindSimpleGroupMembers, snapshotTS, nostr.Tags{
 		{"d", groupID},
 		{"p", memberA.Hex()},
 		{"p", memberB.Hex()},
@@ -333,21 +339,15 @@ func TestGroupStore_WarmCaches_FromMembersSnapshot(t *testing.T) {
 	// no role positions. WarmCaches uses this only to ensure listed
 	// admins are visible as members even if the 39002 snapshot is
 	// stale and missed them.
-	mkAndSave(nostr.KindSimpleGroupAdmins, nostr.Tags{
+	mkAndSave(nostr.KindSimpleGroupAdmins, snapshotTS, nostr.Tags{
 		{"d", groupID},
 		{"p", adminOnlyPK.Hex()},
-	})
-	// Tail-of-log put-user that the snapshot doesn't cover yet.
-	// Live updates post-startup would pull this in via the event
-	// handler; warm-up should NOT see it.
-	mkAndSave(nostr.KindSimpleGroupPutUser, nostr.Tags{
-		{"h", groupID},
-		{"p", tailMember.Hex()},
 	})
 
 	// Re-warm caches against the just-saved fixtures.
 	inst.Groups.membershipCache.Delete(groupID)
 	inst.Groups.roleCache.Delete(groupID)
+	inst.Groups.membershipFullyLoaded.Delete(groupID)
 	inst.Groups.cachesWarmed = false
 	inst.Groups.WarmCaches()
 
@@ -366,13 +366,6 @@ func TestGroupStore_WarmCaches_FromMembersSnapshot(t *testing.T) {
 	if !inst.Groups.IsMember(groupID, adminOnlyPK) {
 		t.Errorf("adminOnlyPK missing from cache; admins listed in kind-39001 are implicitly members and must be surfaced even if the 39002 snapshot didn't list them")
 	}
-	// tailMember was added via a kind-9000 saved with nostr.Now(),
-	// the snapshots also use nostr.Now(). With the lag-window-closure
-	// tail-of-log read, events strictly after the snapshot get
-	// applied. In this test the timestamps coincide (same second),
-	// so tailMember is on the boundary — accept either outcome.
-	// The dedicated TestGroupStore_WarmCaches_TailReplaysPostSnapshot
-	// pins the strictly-newer case.
 }
 
 // TestGroupStore_WarmCaches_TailReplaysPostSnapshot verifies the
