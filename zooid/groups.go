@@ -1,6 +1,7 @@
 package zooid
 
 import (
+	"bytes"
 	"encoding/json"
 	"log"
 	"sort"
@@ -159,8 +160,8 @@ func (g *GroupStore) WarmCaches() {
 		}
 	}
 
-	// Load group memberships from the kind-39002 (members) and kind-39001
-	// (admins, with roles) snapshot events that the relay maintains.
+	// Load group memberships from the kind-39002 (members) snapshot
+	// and the kind-39001 (admins) snapshot the relay maintains.
 	//
 	// Until 2026-05 this loop replayed the full kind-9000/9001 put/remove
 	// log, which on production with 50k members had grown to 90k+ events.
@@ -170,24 +171,35 @@ func (g *GroupStore) WarmCaches() {
 	// real members. Issue #25.
 	//
 	// Reading snapshots is O(groups), not O(membership_events). One 39002
-	// per group carries the full current member set; one 39001 carries the
-	// admins with roles. Lag window: any change made between the last
-	// snapshot emission and the restart is missed by this rebuild — the
-	// live event handler in groups.go updates the cache on each new
-	// kind-9000/9001 going forward, so the gap closes naturally as those
-	// events arrive.
-	// QueryEvents returns events ordered by created_at DESC, so the first
-	// event we see per group is the newest. NIP-29 39001/39002 are
-	// addressable-replaceable keyed by d-tag; the relay normally keeps
-	// only one per group. We still defend against duplicates here so a
-	// stale leftover doesn't stomp the current state.
+	// per group carries the full current member set; roles ride on each
+	// p-tag at positions 2+ (UpdateMembersList writes them this way).
+	// kind-39001 carries only `{"p", pubkey}` per admin — no role
+	// positions — and is read here only as a defensive safety net so an
+	// admin missing from a stale 39002 still surfaces as a member.
 	//
-	// In this codebase the **roles live on kind-39002**, not 39001 —
-	// see UpdateMembersList: the per-member p-tag is
-	// `{"p", pubkey, role1, role2, ...}`. UpdateAdminsList emits
-	// `{"p", pubkey}` only. So the members snapshot drives both the
-	// membership and the role caches.
-	seenMembers := make(map[string]struct{})
+	// Lag window: any change made between the last snapshot emission for
+	// a group and a restart is missed by this rebuild. The live event
+	// handler in groups.go updates the cache on each new kind-9000/9001
+	// going forward, so the gap closes naturally as those events arrive.
+	// QueryEvents returns events ordered by created_at DESC. We
+	// dedupe per group with an explicit (created_at, id) tiebreaker
+	// because two concurrent ReplaceEvent calls can race past the
+	// `<=` dedup check in events.go and leave two rows with the
+	// same created_at — DESC alone is unstable in that case. id
+	// is the canonical event hash, so lexicographic compare gives
+	// deterministic ordering.
+	type snapshotKey struct {
+		createdAt nostr.Timestamp
+		id        nostr.ID
+	}
+	newer := func(a, b snapshotKey) bool {
+		if a.createdAt != b.createdAt {
+			return a.createdAt > b.createdAt
+		}
+		return bytes.Compare(a.id[:], b.id[:]) > 0
+	}
+
+	seenMembers := make(map[string]snapshotKey)
 	for event := range g.Events.QueryEvents(nostr.Filter{
 		Kinds: []nostr.Kind{nostr.KindSimpleGroupMembers},
 	}, 0) {
@@ -195,14 +207,19 @@ func (g *GroupStore) WarmCaches() {
 		if h == "" {
 			continue
 		}
-		if _, dup := seenMembers[h]; dup {
+		k := snapshotKey{createdAt: event.CreatedAt, id: event.ID}
+		if existing, ok := seenMembers[h]; ok && !newer(k, existing) {
 			continue
 		}
-		seenMembers[h] = struct{}{}
+		seenMembers[h] = k
 		ms := g.getOrCreateMemberSet(h)
 		rs := g.getOrCreateRoleSet(h)
 		ms.mu.Lock()
 		rs.mu.Lock()
+		// Replace state — the old snapshot might have stale members
+		// or stale role assignments we need to drop.
+		ms.members = make(map[nostr.PubKey]struct{}, len(event.Tags))
+		rs.roles = make(map[nostr.PubKey]map[string]struct{})
 		for tag := range event.Tags.FindAll("p") {
 			if len(tag) < 2 {
 				continue
@@ -225,10 +242,15 @@ func (g *GroupStore) WarmCaches() {
 	}
 
 	// Belt-and-suspenders: admins per NIP-29 are implicitly members.
-	// If a 39001 lists a pubkey that's missing from a possibly-stale
-	// 39002 snapshot, surface them as a member so they don't get
+	// If a 39001 lists a pubkey that's missing from a stale 39002
+	// snapshot, surface them as a member so they don't get
 	// false-rejected by IsMember after a restart.
-	seenAdmins := make(map[string]struct{})
+	//
+	// Only honor 39001 admins as members when this 39001 is newer
+	// than the 39002 we loaded for the same group. If 39002 is newer,
+	// it's authoritative — an admin who was removed (and so dropped
+	// from the newer 39002) must not get re-added by an older 39001.
+	seenAdmins := make(map[string]snapshotKey)
 	for event := range g.Events.QueryEvents(nostr.Filter{
 		Kinds: []nostr.Kind{nostr.KindSimpleGroupAdmins},
 	}, 0) {
@@ -236,10 +258,21 @@ func (g *GroupStore) WarmCaches() {
 		if h == "" {
 			continue
 		}
-		if _, dup := seenAdmins[h]; dup {
+		k := snapshotKey{createdAt: event.CreatedAt, id: event.ID}
+		if existing, ok := seenAdmins[h]; ok && !newer(k, existing) {
 			continue
 		}
-		seenAdmins[h] = struct{}{}
+		seenAdmins[h] = k
+		// Only skip when the 39002 we already loaded is STRICTLY
+		// newer than this 39001. Equal created_at falls through —
+		// the two snapshots are typically debounced together and
+		// reflect the same moment, and we can't claim 39002 is
+		// authoritative just because of an arbitrary id tiebreak.
+		// 39001 newer also falls through (its admin promotions
+		// haven't propagated to 39002 yet).
+		if memberKey, hasMembers := seenMembers[h]; hasMembers && k.createdAt < memberKey.createdAt {
+			continue
+		}
 		ms := g.getOrCreateMemberSet(h)
 		ms.mu.Lock()
 		for tag := range event.Tags.FindAll("p") {
@@ -261,6 +294,26 @@ func (g *GroupStore) WarmCaches() {
 		if err := g.UpdateMetadata(event); err != nil {
 			log.Printf("Failed to regenerate metadata for group %q: %v", h, err)
 		}
+	}
+
+	// Heuristic warm-up failure detection. The QueryEvents iter.Seq
+	// surface can't return errors — queryEventsWith logs and stops on
+	// timeout but the consumer just sees a short sequence. If the
+	// metadata cache shows we have groups but the members/admins
+	// snapshot reads came back with no data at all, the most likely
+	// explanation is a query timeout under DB pressure (the very
+	// scenario that motivated issue #25 in the first place). Stay in
+	// pre-warm mode so IsMember falls back to its DB query path —
+	// slow per-call but correct, vs. setting cachesWarmed=true and
+	// silently false-rejecting members.
+	metadataCount := 0
+	g.metadataCache.Range(func(_, _ any) bool {
+		metadataCount++
+		return true
+	})
+	if metadataCount > 0 && len(seenMembers) == 0 && len(seenAdmins) == 0 {
+		log.Printf("WarmCaches: %d groups in metadata but 0 members/admins snapshot events read — staying in pre-warm mode (IsMember will fall back to DB)", metadataCount)
+		return
 	}
 
 	g.cachesWarmed = true

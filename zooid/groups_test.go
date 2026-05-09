@@ -370,3 +370,103 @@ func TestGroupStore_WarmCaches_FromMembersSnapshot(t *testing.T) {
 		t.Errorf("tailMember unexpectedly in cache; warm-up should read snapshots only, not tail of put/remove log")
 	}
 }
+
+// TestGroupStore_WarmCaches_StaleAdminsSnapshotDoesNotOverride locks in
+// the cross-kind staleness rule: a 39001 (admins) snapshot that's
+// strictly older than the 39002 (members) snapshot for the same group
+// must NOT add its listed pubkeys to the membership cache. Otherwise
+// an admin who was demoted+removed (and so dropped from the newer
+// 39002) would get re-added by the older 39001 — exactly the
+// false-acceptance class we'd be trying to avoid in the false-rejection
+// fix. Issue #25 follow-up review.
+func TestGroupStore_WarmCaches_StaleAdminsSnapshotDoesNotOverride(t *testing.T) {
+	inst := createTestInstance()
+	const groupID = "stalegrp"
+
+	relaySec := inst.Config.secret
+	currentMember := nostr.Generate().Public()
+	demotedAndRemoved := nostr.Generate().Public()
+
+	mkAndSave := func(kind nostr.Kind, ts nostr.Timestamp, tags nostr.Tags) {
+		evt := nostr.Event{
+			Kind:      kind,
+			CreatedAt: ts,
+			PubKey:    relaySec.Public(),
+			Tags:      tags,
+		}
+		evt.Sign(relaySec)
+		if err := inst.Events.SaveEvent(evt); err != nil {
+			t.Fatalf("SaveEvent(kind=%d): %v", kind, err)
+		}
+	}
+
+	// Older 39001 with the demoted user still listed.
+	mkAndSave(nostr.KindSimpleGroupAdmins, nostr.Timestamp(1000), nostr.Tags{
+		{"d", groupID},
+		{"p", demotedAndRemoved.Hex()},
+	})
+	// Newer 39002 reflecting current state — only the remaining member.
+	mkAndSave(nostr.KindSimpleGroupMembers, nostr.Timestamp(2000), nostr.Tags{
+		{"d", groupID},
+		{"p", currentMember.Hex()},
+	})
+
+	inst.Groups.membershipCache.Delete(groupID)
+	inst.Groups.roleCache.Delete(groupID)
+	inst.Groups.cachesWarmed = false
+	inst.Groups.WarmCaches()
+
+	if !inst.Groups.IsMember(groupID, currentMember) {
+		t.Errorf("currentMember missing from cache after WarmCaches")
+	}
+	if inst.Groups.IsMember(groupID, demotedAndRemoved) {
+		t.Errorf("demotedAndRemoved is in cache; an older 39001 must not re-add a pubkey that the newer 39002 has dropped")
+	}
+}
+
+// TestGroupStore_WarmCaches_StaysPreWarmWhenSnapshotReadsEmpty pins
+// the heuristic that detects a catastrophic warm-up failure (e.g. the
+// snapshot QueryEvents calls timing out under DB pressure): if the
+// metadata cache shows we have groups but the members/admins reads
+// returned nothing at all, leave cachesWarmed=false so IsMember keeps
+// using its DB query fallback. Issue #25 follow-up review.
+func TestGroupStore_WarmCaches_StaysPreWarmWhenSnapshotReadsEmpty(t *testing.T) {
+	inst := createTestInstance()
+
+	// Save a group metadata event but NO members/admins snapshots.
+	// This simulates the failure mode where the metadata read
+	// succeeded but the snapshot reads came back empty (timeout, db
+	// outage, partial read).
+	relaySec := inst.Config.secret
+	metaEvent := nostr.Event{
+		Kind:      nostr.KindSimpleGroupMetadata,
+		CreatedAt: nostr.Now(),
+		PubKey:    relaySec.Public(),
+		Tags: nostr.Tags{
+			{"d", "lonelygroup"},
+			{"name", "Lonely"},
+		},
+	}
+	metaEvent.Sign(relaySec)
+	if err := inst.Events.SaveEvent(metaEvent); err != nil {
+		t.Fatalf("SaveEvent metadata: %v", err)
+	}
+
+	// Reset everything so WarmCaches runs from scratch against the
+	// just-saved fixture.
+	inst.Groups.metadataCache.Range(func(k, _ any) bool {
+		inst.Groups.metadataCache.Delete(k)
+		return true
+	})
+	inst.Groups.membershipCache.Range(func(k, _ any) bool {
+		inst.Groups.membershipCache.Delete(k)
+		return true
+	})
+	inst.Groups.cachesWarmed = false
+
+	inst.Groups.WarmCaches()
+
+	if inst.Groups.cachesWarmed {
+		t.Errorf("cachesWarmed unexpectedly true: metadata has groups but no membership snapshots were read; should stay in pre-warm mode so IsMember falls back to DB")
+	}
+}
