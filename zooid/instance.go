@@ -495,6 +495,14 @@ func (instance *Instance) OnEventSaved(ctx context.Context, event nostr.Event) {
 
 	if event.Kind == nostr.KindSimpleGroupCreateGroup {
 		instance.Groups.creatorCache.Store(h, event.PubKey)
+		// Brand-new group: there are no pre-existing members beyond
+		// the creator we're about to add. Mark membership as fully
+		// loaded BEFORE AddMember/ScheduleMembersListUpdate run, so
+		// IsMember treats the cache as authoritative for this group
+		// from creation onward and the eventual UpdateMembersList
+		// publishes a correct snapshot the next restart's
+		// WarmCaches will accept. Issue #25.
+		instance.Groups.membershipFullyLoaded.Store(h, struct{}{})
 		if err := instance.Groups.AddMember(h, event.PubKey); err != nil {
 			log.Printf("Failed to add creator %s to group %q: %v", event.PubKey, h, err)
 		}

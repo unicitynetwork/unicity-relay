@@ -1,6 +1,7 @@
 package zooid
 
 import (
+	"bytes"
 	"encoding/json"
 	"log"
 	"sort"
@@ -94,6 +95,15 @@ type GroupStore struct {
 	creatorCache    sync.Map // map[string]nostr.PubKey       (key = group h)
 	cachesWarmed    bool
 
+	// membershipFullyLoaded tracks groups for which WarmCaches
+	// successfully applied a kind-39002 snapshot — meaning the
+	// membershipCache holds the complete known member set for that
+	// group. IsMember consults this per group so a partial WarmCaches
+	// read (timeout mid-iteration → only some groups loaded) silently
+	// false-rejects nothing: groups not in this set fall back to the
+	// DB query path. Issue #25 follow-up review.
+	membershipFullyLoaded sync.Map // map[string]struct{} (key = group h)
+
 	// DebounceDelay coalesces rapid bursts of kind-39002 / kind-39000 rewrites
 	// for the same group into a single publish, scheduled DebounceDelay after
 	// the first scheduled trigger in a burst. NIP-29 requires republishing the
@@ -159,44 +169,232 @@ func (g *GroupStore) WarmCaches() {
 		}
 	}
 
-	// Load all group memberships
-	memberFilter := nostr.Filter{
-		Kinds: []nostr.Kind{nostr.KindSimpleGroupPutUser, nostr.KindSimpleGroupRemoveUser},
+	// Load group memberships from the kind-39002 (members) snapshot
+	// and the kind-39001 (admins) snapshot the relay maintains.
+	//
+	// Until 2026-05 this loop replayed the full kind-9000/9001 put/remove
+	// log, which on production with 50k members had grown to 90k+ events.
+	// The replay had to fit in dbOpTimeout (30s) including JSON-tag parses;
+	// under any DB CPU pressure the iteration timed out partway, the slice
+	// was partial, the cache ended up partial, and IsMember false-rejected
+	// real members. Issue #25.
+	//
+	// Reading snapshots is O(groups), not O(membership_events). One 39002
+	// per group carries the full current member set; roles ride on each
+	// p-tag at positions 2+ (UpdateMembersList writes them this way).
+	// kind-39001 carries only `{"p", pubkey}` per admin — no role
+	// positions — and is read here only as a defensive safety net so an
+	// admin missing from a stale 39002 still surfaces as a member.
+	//
+	// Lag window closure: after applying snapshots, we read the tail of
+	// the kind-9000/9001 log since the OLDEST snapshot's created_at and
+	// re-apply any per-group events the snapshot didn't cover. Without
+	// this, membership changes that happened after a group's last 39002
+	// emission but before the relay restart stay missing from the cache
+	// indefinitely (the live handler doesn't replay them on its own).
+	// QueryEvents returns events ordered by created_at DESC. We
+	// dedupe per group with an explicit (created_at, id) tiebreaker
+	// because two concurrent ReplaceEvent calls can race past the
+	// `<=` dedup check in events.go and leave two rows with the
+	// same created_at — DESC alone is unstable in that case. id
+	// is the canonical event hash, so lexicographic compare gives
+	// deterministic ordering.
+	type snapshotKey struct {
+		createdAt nostr.Timestamp
+		id        nostr.ID
 	}
-	// We need to process events oldest-first to replay the membership log correctly
-	allEvents := slices.Collect(g.Events.QueryEvents(memberFilter, 0))
-	for _, event := range Reversed(allEvents) {
-		h := GetGroupIDFromEvent(event)
+	newer := func(a, b snapshotKey) bool {
+		if a.createdAt != b.createdAt {
+			return a.createdAt > b.createdAt
+		}
+		return bytes.Compare(a.id[:], b.id[:]) > 0
+	}
+
+	seenMembers := make(map[string]snapshotKey)
+	for event := range g.Events.QueryEvents(nostr.Filter{
+		Kinds: []nostr.Kind{nostr.KindSimpleGroupMembers},
+	}, 0) {
+		h := event.Tags.GetD()
 		if h == "" {
 			continue
 		}
+		k := snapshotKey{createdAt: event.CreatedAt, id: event.ID}
+		if existing, ok := seenMembers[h]; ok && !newer(k, existing) {
+			continue
+		}
+		seenMembers[h] = k
+		// Mark this group's membership as fully loaded — IsMember
+		// consults this per-group flag and only treats the cache as
+		// authoritative when set, so a group whose 39002 didn't get
+		// read (partial scan, timeout, etc.) falls back to DB.
+		g.membershipFullyLoaded.Store(h, struct{}{})
+		ms := g.getOrCreateMemberSet(h)
+		rs := g.getOrCreateRoleSet(h)
+		ms.mu.Lock()
+		rs.mu.Lock()
+		// Replace state — the old snapshot might have stale members
+		// or stale role assignments we need to drop.
+		ms.members = make(map[nostr.PubKey]struct{}, len(event.Tags))
+		rs.roles = make(map[nostr.PubKey]map[string]struct{})
 		for tag := range event.Tags.FindAll("p") {
+			if len(tag) < 2 {
+				continue
+			}
 			pubkey, err := nostr.PubKeyFromHex(tag[1])
 			if err != nil {
 				continue
 			}
-			ms := g.getOrCreateMemberSet(h)
-			ms.mu.Lock()
-			if event.Kind == nostr.KindSimpleGroupPutUser {
-				ms.members[pubkey] = struct{}{}
-			} else {
-				delete(ms.members, pubkey)
-			}
-			ms.mu.Unlock()
-
-			// Track roles from put-user events (positions 2+ in the p tag)
-			rs := g.getOrCreateRoleSet(h)
-			rs.mu.Lock()
-			if event.Kind == nostr.KindSimpleGroupPutUser && len(tag) > 2 {
+			ms.members[pubkey] = struct{}{}
+			if len(tag) > 2 {
 				roles := make(map[string]struct{}, len(tag)-2)
 				for i := 2; i < len(tag); i++ {
 					roles[tag[i]] = struct{}{}
 				}
 				rs.roles[pubkey] = roles
-			} else {
-				delete(rs.roles, pubkey)
+			}
+		}
+		rs.mu.Unlock()
+		ms.mu.Unlock()
+	}
+
+	// Belt-and-suspenders: admins per NIP-29 are implicitly members.
+	// If a 39001 lists a pubkey that's missing from a stale 39002
+	// snapshot, surface them as a member so they don't get
+	// false-rejected by IsMember after a restart.
+	//
+	// Skip 39001-driven adds when the 39002 we loaded for the same
+	// group is STRICTLY newer — an admin removed by the newer 39002
+	// must not get re-added by an older 39001. Equal created_at
+	// falls through (apply) — see the per-iteration comment below.
+	seenAdmins := make(map[string]snapshotKey)
+	for event := range g.Events.QueryEvents(nostr.Filter{
+		Kinds: []nostr.Kind{nostr.KindSimpleGroupAdmins},
+	}, 0) {
+		h := event.Tags.GetD()
+		if h == "" {
+			continue
+		}
+		k := snapshotKey{createdAt: event.CreatedAt, id: event.ID}
+		if existing, ok := seenAdmins[h]; ok && !newer(k, existing) {
+			continue
+		}
+		seenAdmins[h] = k
+		// Only skip when the 39002 we already loaded is STRICTLY
+		// newer than this 39001. Equal created_at falls through —
+		// the two snapshots are typically debounced together and
+		// reflect the same moment, and we can't claim 39002 is
+		// authoritative just because of an arbitrary id tiebreak.
+		// 39001 newer also falls through (its admin promotions
+		// haven't propagated to 39002 yet).
+		if memberKey, hasMembers := seenMembers[h]; hasMembers && k.createdAt < memberKey.createdAt {
+			continue
+		}
+		ms := g.getOrCreateMemberSet(h)
+		ms.mu.Lock()
+		for tag := range event.Tags.FindAll("p") {
+			if len(tag) < 2 {
+				continue
+			}
+			if pubkey, err := nostr.PubKeyFromHex(tag[1]); err == nil {
+				ms.members[pubkey] = struct{}{}
+			}
+		}
+		ms.mu.Unlock()
+	}
+
+	// Tail-of-log read: replay any kind-9000/9001 events the
+	// snapshots didn't cover (events emitted after a group's last
+	// 39002 but before this restart). Without this, those membership
+	// changes stay missing from the cache and IsMember would
+	// false-reject the affected members until a new 39002 happens to
+	// be emitted for that group on the next change.
+	//
+	// We bound the tail by `Since = oldest 39002 created_at across
+	// all loaded groups`, then per-event we apply the change ONLY if
+	// the event is strictly newer than that group's snapshot. So old
+	// events covered by their group's snapshot are skipped per-row,
+	// and groups without a snapshot are skipped entirely (their
+	// membership stays under DB-fallback via IsMember). This keeps
+	// the tail size proportional to time-since-newest-snapshot
+	// (typically seconds-to-minutes thanks to the debounced 39002
+	// emission pipeline), not to total membership history.
+	if len(seenMembers) > 0 {
+		oldest := nostr.Timestamp(0)
+		first := true
+		for _, k := range seenMembers {
+			if first || k.createdAt < oldest {
+				oldest = k.createdAt
+				first = false
+			}
+		}
+		// QueryEvents returns DESC; replaying put/remove DESC gives
+		// the wrong final state when an Add+Remove pair lands in
+		// the tail (the remove fires against an empty set, then the
+		// add re-introduces the user). Collect and reverse to
+		// process oldest-first.
+		tail := slices.Collect(g.Events.QueryEvents(nostr.Filter{
+			Kinds: []nostr.Kind{nostr.KindSimpleGroupPutUser, nostr.KindSimpleGroupRemoveUser},
+			Since: oldest,
+		}, 0))
+		for _, event := range Reversed(tail) {
+			h := GetGroupIDFromEvent(event)
+			if h == "" {
+				continue
+			}
+			snap, hasSnap := seenMembers[h]
+			if !hasSnap {
+				// No snapshot for this group → leave it for DB
+				// fallback via IsMember.
+				continue
+			}
+			// Strictly-newer-than-snapshot via the same
+			// (created_at, id) tiebreak used elsewhere. nostr
+			// timestamps are second-resolution, so plain `<=`
+			// drops events emitted in the same second as the
+			// snapshot — and those are exactly the changes the
+			// snapshot pipeline's debounce makes most likely.
+			eventKey := snapshotKey{createdAt: event.CreatedAt, id: event.ID}
+			if !newer(eventKey, snap) {
+				continue
+			}
+			ms := g.getOrCreateMemberSet(h)
+			rs := g.getOrCreateRoleSet(h)
+			ms.mu.Lock()
+			rs.mu.Lock()
+			for tag := range event.Tags.FindAll("p") {
+				if len(tag) < 2 {
+					continue
+				}
+				pubkey, err := nostr.PubKeyFromHex(tag[1])
+				if err != nil {
+					continue
+				}
+				if event.Kind == nostr.KindSimpleGroupPutUser {
+					ms.members[pubkey] = struct{}{}
+					// PutUser carries roles at p-tag positions 2+
+					// (NIP-29). Apply them so a role
+					// granted/cleared post-snapshot doesn't get
+					// silently lost from rs.roles. AddMember
+					// (the cache-update path) clears roles on
+					// each call, so do the same here: replace
+					// the role set if positions 2+ exist, drop
+					// it otherwise.
+					if len(tag) > 2 {
+						roles := make(map[string]struct{}, len(tag)-2)
+						for i := 2; i < len(tag); i++ {
+							roles[tag[i]] = struct{}{}
+						}
+						rs.roles[pubkey] = roles
+					} else {
+						delete(rs.roles, pubkey)
+					}
+				} else {
+					delete(ms.members, pubkey)
+					delete(rs.roles, pubkey)
+				}
 			}
 			rs.mu.Unlock()
+			ms.mu.Unlock()
 		}
 	}
 
@@ -208,6 +406,26 @@ func (g *GroupStore) WarmCaches() {
 		if err := g.UpdateMetadata(event); err != nil {
 			log.Printf("Failed to regenerate metadata for group %q: %v", h, err)
 		}
+	}
+
+	// Heuristic warm-up failure detection. The QueryEvents iter.Seq
+	// surface can't return errors — queryEventsWith logs and stops on
+	// timeout but the consumer just sees a short sequence. If the
+	// metadata cache shows we have groups but the members/admins
+	// snapshot reads came back with no data at all, the most likely
+	// explanation is a query timeout under DB pressure (the very
+	// scenario that motivated issue #25 in the first place). Stay in
+	// pre-warm mode so IsMember falls back to its DB query path —
+	// slow per-call but correct, vs. setting cachesWarmed=true and
+	// silently false-rejecting members.
+	metadataCount := 0
+	g.metadataCache.Range(func(_, _ any) bool {
+		metadataCount++
+		return true
+	})
+	if metadataCount > 0 && len(seenMembers) == 0 && len(seenAdmins) == 0 {
+		log.Printf("WarmCaches: %d groups in metadata but 0 members/admins snapshot events read — staying in pre-warm mode (IsMember will fall back to DB)", metadataCount)
+		return
 	}
 
 	g.cachesWarmed = true
@@ -403,6 +621,7 @@ func (g *GroupStore) DeleteGroup(h string) {
 
 	g.metadataCache.Delete(h)
 	g.membershipCache.Delete(h)
+	g.membershipFullyLoaded.Delete(h)
 	g.roleCache.Delete(h)
 	g.creatorCache.Delete(h)
 }
@@ -498,7 +717,12 @@ func (g *GroupStore) RemoveMember(h string, pubkey nostr.PubKey) error {
 }
 
 func (g *GroupStore) IsMember(h string, pubkey nostr.PubKey) bool {
-	if g.cachesWarmed {
+	// Per-group authoritative check: only trust the cache if WarmCaches
+	// successfully loaded a kind-39002 snapshot for this group. If not
+	// (partial WarmCaches scan, group created post-restart with no
+	// snapshot yet, etc.), fall through to the DB query path. Issue
+	// #25 follow-up review.
+	if _, fullyLoaded := g.membershipFullyLoaded.Load(h); fullyLoaded {
 		if v, ok := g.membershipCache.Load(h); ok {
 			ms := v.(*memberSet)
 			ms.mu.RLock()
@@ -506,7 +730,9 @@ func (g *GroupStore) IsMember(h string, pubkey nostr.PubKey) bool {
 			ms.mu.RUnlock()
 			return found
 		}
-		return false
+		// Marked fully loaded but no cache entry — shouldn't happen
+		// because they're set together. Defensive: treat as unloaded
+		// and fall through.
 	}
 
 	filter := nostr.Filter{
@@ -517,17 +743,31 @@ func (g *GroupStore) IsMember(h string, pubkey nostr.PubKey) bool {
 		},
 	}
 
-	for event := range g.Events.QueryEvents(filter, 1) {
-		if event.Kind == nostr.KindSimpleGroupPutUser {
-			return true
+	// Walk all (typically very few) put/remove events for this
+	// (pubkey, group) pair and pick the strictly latest by
+	// (created_at, id). QueryEvents orders by created_at DESC but
+	// with no secondary tiebreak — when add+remove land in the same
+	// second (test rapid-fire, real bursts), `LIMIT 1` returns an
+	// arbitrary one and the membership decision flips run-to-run.
+	// id is the canonical event hash so bytes.Compare gives a
+	// deterministic, total tiebreak.
+	var latest nostr.Event
+	var have bool
+	for event := range g.Events.QueryEvents(filter, 0) {
+		if !have {
+			latest = event
+			have = true
+			continue
 		}
-
-		if event.Kind == nostr.KindSimpleGroupRemoveUser {
-			return false
+		if event.CreatedAt > latest.CreatedAt ||
+			(event.CreatedAt == latest.CreatedAt && bytes.Compare(event.ID[:], latest.ID[:]) > 0) {
+			latest = event
 		}
 	}
-
-	return false
+	if !have {
+		return false
+	}
+	return latest.Kind == nostr.KindSimpleGroupPutUser
 }
 
 func (g *GroupStore) GetMembers(h string) []nostr.PubKey {
@@ -584,6 +824,23 @@ func (g *GroupStore) GetMemberCount(h string) int {
 }
 
 func (g *GroupStore) UpdateMembersList(h string) error {
+	// Refuse to publish a snapshot when the in-memory membership for
+	// this group isn't authoritative (e.g. WarmCaches missed its 39002
+	// because of a partial scan). GetMembers gates on the global
+	// cachesWarmed flag and returns an empty list if no cache entry
+	// exists, so without this guard we'd clobber the existing on-disk
+	// 39002 with an empty / partial member list — every subsequent
+	// restart's WarmCaches would load that bad snapshot. Issue #25.
+	//
+	// The next successful WarmCaches will reload the existing 39002
+	// and mark the group fully loaded; the live event handler keeps
+	// the cache in sync from there, and later UpdateMembersList calls
+	// can resume publishing.
+	if _, fullyLoaded := g.membershipFullyLoaded.Load(h); !fullyLoaded {
+		log.Printf("UpdateMembersList: skipping group %q — cache not fully loaded; refusing to publish potentially-partial 39002", h)
+		return nil
+	}
+
 	tags := nostr.Tags{
 		nostr.Tag{"-"},
 		nostr.Tag{"d", h},
@@ -620,6 +877,24 @@ func (g *GroupStore) UpdateMembersList(h string) error {
 		Tags:      tags,
 	}
 
+	// NB: we deliberately do NOT mark membershipFullyLoaded here.
+	// UpdateMembersList just rewrites the on-disk 39002 from
+	// whatever the in-memory cache currently holds. If the cache
+	// was authoritative going in (fullyLoaded was already set), the
+	// rewrite is a fresh, correct snapshot — and the marker stays
+	// set. If the cache was NOT authoritative (e.g. WarmCaches
+	// missed this group's 39002 → fullyLoaded=false), promoting it
+	// here would publish a partial member list AND mark the cache
+	// authoritative, silently false-rejecting real members on
+	// future IsMember calls and persisting the wrong snapshot for
+	// the next restart's WarmCaches to consume. Issue #25 review.
+	//
+	// Authoritative-state ownership lives elsewhere:
+	//  - WarmCaches sets the marker after applying a 39002 read.
+	//  - OnEventSaved for kind-9007 (new group creation) sets it
+	//    explicitly before the first AddMember/UpdateMembersList,
+	//    because a brand-new group has no pre-existing members and
+	//    the cache trivially reflects full membership.
 	return g.Events.SignAndStoreEvent(&event, true)
 }
 
