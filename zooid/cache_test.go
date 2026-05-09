@@ -361,8 +361,22 @@ func TestGroupMembershipCache_WarmUp(t *testing.T) {
 	pk1 := nostr.Generate().Public()
 	pk2 := nostr.Generate().Public()
 
-	groups.AddMember("grp1", pk1)
-	groups.AddMember("grp1", pk2)
+	// Persist a kind-39002 (members snapshot) — that's what WarmCaches
+	// reads (issue #25). In production this snapshot is emitted by the
+	// relay's own pipeline after AddMember; here we write it directly so
+	// the test isolates the warm-up read path.
+	snapshot := nostr.Event{
+		Kind:      nostr.KindSimpleGroupMembers,
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"d", "grp1"},
+			{"p", pk1.Hex()},
+			{"p", pk2.Hex()},
+		},
+	}
+	if err := groups.Events.SignAndStoreEvent(&snapshot, false); err != nil {
+		t.Fatalf("save members snapshot: %v", err)
+	}
 
 	// Create fresh store and warm
 	groups2 := &GroupStore{
@@ -576,21 +590,37 @@ func TestRoleCache_ClearOnRemove(t *testing.T) {
 	}
 }
 
-func TestRoleCache_WarmUpFromPutUserEvents(t *testing.T) {
+// TestRoleCache_WarmUpFromAdminsSnapshot — was
+// TestRoleCache_WarmUpFromPutUserEvents. WarmCaches now reads the
+// kind-39001 admins snapshot (one per group) instead of replaying
+// kind-9000 put-user events; the role-position semantics on the p-tag
+// are the same. Issue #25.
+func TestRoleCache_WarmUpFromAdminsSnapshot(t *testing.T) {
 	groups, _ := createTestGroupStore()
 
 	pk := nostr.Generate().Public()
 
-	// Store a put-user event with writer role (p tag has role at position 2+)
-	putEvent := nostr.Event{
-		Kind:      nostr.KindSimpleGroupPutUser,
+	// kind-39001 admins snapshot: p-tag positions 2+ are roles per NIP-29.
+	adminsSnapshot := nostr.Event{
+		Kind:      nostr.KindSimpleGroupAdmins,
 		CreatedAt: nostr.Now(),
 		Tags: nostr.Tags{
+			{"d", "rolegrp"},
 			{"p", pk.Hex(), "writer"},
-			{"h", "rolegrp"},
 		},
 	}
-	groups.Events.SignAndStoreEvent(&putEvent, false)
+	groups.Events.SignAndStoreEvent(&adminsSnapshot, false)
+
+	// And the corresponding members snapshot — admins are also members.
+	membersSnapshot := nostr.Event{
+		Kind:      nostr.KindSimpleGroupMembers,
+		CreatedAt: nostr.Now(),
+		Tags: nostr.Tags{
+			{"d", "rolegrp"},
+			{"p", pk.Hex()},
+		},
+	}
+	groups.Events.SignAndStoreEvent(&membersSnapshot, false)
 
 	// Fresh store and warm
 	groups2 := &GroupStore{
@@ -601,39 +631,56 @@ func TestRoleCache_WarmUpFromPutUserEvents(t *testing.T) {
 	groups2.WarmCaches()
 
 	if !groups2.HasRole("rolegrp", pk, "writer") {
-		t.Error("HasRole should return true after WarmCaches with put-user role")
+		t.Error("HasRole should return true after WarmCaches with admins-snapshot role")
 	}
 	if !groups2.IsMember("rolegrp", pk) {
 		t.Error("IsMember should also return true")
 	}
 }
 
-func TestRoleCache_WarmUpRoleReplacement(t *testing.T) {
+// TestRoleCache_WarmUp_NewerSnapshotWins replaces the previous
+// TestRoleCache_WarmUpRoleReplacement: now that WarmCaches reads
+// kind-39001/39002 snapshots and "first wins per group" by created_at
+// DESC, the regression we want to lock in is that a stale leftover
+// snapshot (e.g. one that wasn't yet replaced by the addressable-
+// replaceable dedup) does not stomp the current state. Issue #25.
+func TestRoleCache_WarmUp_NewerSnapshotWins(t *testing.T) {
 	groups, _ := createTestGroupStore()
 
 	pk := nostr.Generate().Public()
 
-	// First put-user with writer role
-	putEvent1 := nostr.Event{
-		Kind:      nostr.KindSimpleGroupPutUser,
+	// Older 39001: pk had the writer role.
+	oldAdmins := nostr.Event{
+		Kind:      nostr.KindSimpleGroupAdmins,
 		CreatedAt: nostr.Timestamp(1000),
 		Tags: nostr.Tags{
+			{"d", "replacegrp"},
 			{"p", pk.Hex(), "writer"},
-			{"h", "replacegrp"},
 		},
 	}
-	groups.Events.SignAndStoreEvent(&putEvent1, false)
+	groups.Events.SignAndStoreEvent(&oldAdmins, false)
 
-	// Second put-user without writer role (should replace)
-	putEvent2 := nostr.Event{
-		Kind:      nostr.KindSimpleGroupPutUser,
+	// Newer 39001: pk no longer has any role (current state).
+	newAdmins := nostr.Event{
+		Kind:      nostr.KindSimpleGroupAdmins,
 		CreatedAt: nostr.Timestamp(2000),
 		Tags: nostr.Tags{
+			{"d", "replacegrp"},
 			{"p", pk.Hex()},
-			{"h", "replacegrp"},
 		},
 	}
-	groups.Events.SignAndStoreEvent(&putEvent2, false)
+	groups.Events.SignAndStoreEvent(&newAdmins, false)
+
+	// And the matching 39002 so pk is still a member.
+	members := nostr.Event{
+		Kind:      nostr.KindSimpleGroupMembers,
+		CreatedAt: nostr.Timestamp(2000),
+		Tags: nostr.Tags{
+			{"d", "replacegrp"},
+			{"p", pk.Hex()},
+		},
+	}
+	groups.Events.SignAndStoreEvent(&members, false)
 
 	// Fresh store and warm
 	groups2 := &GroupStore{
@@ -644,10 +691,10 @@ func TestRoleCache_WarmUpRoleReplacement(t *testing.T) {
 	groups2.WarmCaches()
 
 	if groups2.HasRole("replacegrp", pk, "writer") {
-		t.Error("HasRole should return false after role was replaced by later put-user")
+		t.Error("HasRole should be false: newer admins snapshot dropped the role, older snapshot must not stomp it")
 	}
 	if !groups2.IsMember("replacegrp", pk) {
-		t.Error("IsMember should still return true")
+		t.Error("IsMember should still return true from the members snapshot")
 	}
 }
 

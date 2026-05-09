@@ -283,3 +283,80 @@ func TestGroupStore_ScheduleMembersList_SyncWhenDelayZero(t *testing.T) {
 	}()
 	_ = g.ScheduleMembersListUpdate("g1")
 }
+
+// TestGroupStore_WarmCaches_FromMembersSnapshot verifies that the warm-up
+// path reads kind-39002 (members snapshot) and kind-39001 (admins
+// snapshot) instead of replaying the kind-9000/9001 put/remove log.
+// Issue #25.
+//
+// Two assertions:
+//
+//  1. Membership and roles loaded from snapshots end up in the caches.
+//  2. A standalone kind-9000 put-user event NOT reflected in any 39002
+//     is intentionally NOT in the warm cache — the live event handler
+//     would pick it up post-startup, but the warm-up only reads
+//     snapshots. Documents the lag-window tradeoff explicitly so a
+//     future refactor doesn't quietly change it.
+func TestGroupStore_WarmCaches_FromMembersSnapshot(t *testing.T) {
+	inst := createTestInstance()
+	const groupID = "general"
+
+	relaySec := inst.Config.secret
+	memberA := nostr.Generate().Public()
+	memberB := nostr.Generate().Public()
+	adminPK := nostr.Generate().Public()
+	tailMember := nostr.Generate().Public() // post-snapshot put
+
+	mkAndSave := func(kind nostr.Kind, tags nostr.Tags) {
+		evt := nostr.Event{
+			Kind:      kind,
+			CreatedAt: nostr.Now(),
+			PubKey:    relaySec.Public(),
+			Tags:      tags,
+		}
+		evt.Sign(relaySec)
+		if err := inst.Events.SaveEvent(evt); err != nil {
+			t.Fatalf("SaveEvent(kind=%d): %v", kind, err)
+		}
+	}
+
+	// Snapshot of members: A and B.
+	mkAndSave(nostr.KindSimpleGroupMembers, nostr.Tags{
+		{"d", groupID},
+		{"p", memberA.Hex()},
+		{"p", memberB.Hex()},
+	})
+	// Snapshot of admins: adminPK with role "admin".
+	mkAndSave(nostr.KindSimpleGroupAdmins, nostr.Tags{
+		{"d", groupID},
+		{"p", adminPK.Hex(), "admin"},
+	})
+	// Tail-of-log put-user that the snapshot doesn't cover yet.
+	// Real post-startup live updates would pull this in via the event
+	// handler; warm-up should NOT see it.
+	mkAndSave(nostr.KindSimpleGroupPutUser, nostr.Tags{
+		{"h", groupID},
+		{"p", tailMember.Hex()},
+	})
+
+	// Re-warm caches against the just-saved fixtures. createTestInstance
+	// already called WarmCaches before our SaveEvents, so we need to
+	// reset the relevant caches and call it again.
+	inst.Groups.membershipCache.Delete(groupID)
+	inst.Groups.roleCache.Delete(groupID)
+	inst.Groups.cachesWarmed = false
+	inst.Groups.WarmCaches()
+
+	if !inst.Groups.IsMember(groupID, memberA) {
+		t.Errorf("memberA missing from cache after WarmCaches; should have been loaded from kind-39002")
+	}
+	if !inst.Groups.IsMember(groupID, memberB) {
+		t.Errorf("memberB missing from cache")
+	}
+	if inst.Groups.IsMember(groupID, tailMember) {
+		t.Errorf("tailMember unexpectedly in cache; warm-up should read snapshots only, not tail of put/remove log")
+	}
+	if !inst.Groups.HasRole(groupID, adminPK, "admin") {
+		t.Errorf("adminPK role missing from cache; should have been loaded from kind-39001")
+	}
+}

@@ -159,45 +159,79 @@ func (g *GroupStore) WarmCaches() {
 		}
 	}
 
-	// Load all group memberships
-	memberFilter := nostr.Filter{
-		Kinds: []nostr.Kind{nostr.KindSimpleGroupPutUser, nostr.KindSimpleGroupRemoveUser},
-	}
-	// We need to process events oldest-first to replay the membership log correctly
-	allEvents := slices.Collect(g.Events.QueryEvents(memberFilter, 0))
-	for _, event := range Reversed(allEvents) {
-		h := GetGroupIDFromEvent(event)
+	// Load group memberships from the kind-39002 (members) and kind-39001
+	// (admins, with roles) snapshot events that the relay maintains.
+	//
+	// Until 2026-05 this loop replayed the full kind-9000/9001 put/remove
+	// log, which on production with 50k members had grown to 90k+ events.
+	// The replay had to fit in dbOpTimeout (30s) including JSON-tag parses;
+	// under any DB CPU pressure the iteration timed out partway, the slice
+	// was partial, the cache ended up partial, and IsMember false-rejected
+	// real members. Issue #25.
+	//
+	// Reading snapshots is O(groups), not O(membership_events). One 39002
+	// per group carries the full current member set; one 39001 carries the
+	// admins with roles. Lag window: any change made between the last
+	// snapshot emission and the restart is missed by this rebuild — the
+	// live event handler in groups.go updates the cache on each new
+	// kind-9000/9001 going forward, so the gap closes naturally as those
+	// events arrive.
+	// QueryEvents returns events ordered by created_at DESC, so the first
+	// event we see per group is the newest. NIP-29 39001/39002 are
+	// addressable-replaceable keyed by d-tag; the relay normally keeps
+	// only one per group. We still defend against duplicates here so a
+	// stale leftover doesn't stomp the current state.
+	seenMembers := make(map[string]struct{})
+	for event := range g.Events.QueryEvents(nostr.Filter{
+		Kinds: []nostr.Kind{nostr.KindSimpleGroupMembers},
+	}, 0) {
+		h := event.Tags.GetD()
 		if h == "" {
 			continue
 		}
+		if _, dup := seenMembers[h]; dup {
+			continue
+		}
+		seenMembers[h] = struct{}{}
+		ms := g.getOrCreateMemberSet(h)
+		ms.mu.Lock()
+		for tag := range event.Tags.FindAll("p") {
+			if pubkey, err := nostr.PubKeyFromHex(tag[1]); err == nil {
+				ms.members[pubkey] = struct{}{}
+			}
+		}
+		ms.mu.Unlock()
+	}
+
+	seenAdmins := make(map[string]struct{})
+	for event := range g.Events.QueryEvents(nostr.Filter{
+		Kinds: []nostr.Kind{nostr.KindSimpleGroupAdmins},
+	}, 0) {
+		h := event.Tags.GetD()
+		if h == "" {
+			continue
+		}
+		if _, dup := seenAdmins[h]; dup {
+			continue
+		}
+		seenAdmins[h] = struct{}{}
+		rs := g.getOrCreateRoleSet(h)
+		rs.mu.Lock()
 		for tag := range event.Tags.FindAll("p") {
 			pubkey, err := nostr.PubKeyFromHex(tag[1])
 			if err != nil {
 				continue
 			}
-			ms := g.getOrCreateMemberSet(h)
-			ms.mu.Lock()
-			if event.Kind == nostr.KindSimpleGroupPutUser {
-				ms.members[pubkey] = struct{}{}
-			} else {
-				delete(ms.members, pubkey)
-			}
-			ms.mu.Unlock()
-
-			// Track roles from put-user events (positions 2+ in the p tag)
-			rs := g.getOrCreateRoleSet(h)
-			rs.mu.Lock()
-			if event.Kind == nostr.KindSimpleGroupPutUser && len(tag) > 2 {
+			// p-tag positions 2+ are roles per NIP-29.
+			if len(tag) > 2 {
 				roles := make(map[string]struct{}, len(tag)-2)
 				for i := 2; i < len(tag); i++ {
 					roles[tag[i]] = struct{}{}
 				}
 				rs.roles[pubkey] = roles
-			} else {
-				delete(rs.roles, pubkey)
 			}
-			rs.mu.Unlock()
 		}
+		rs.mu.Unlock()
 	}
 
 	// Self-heal: regenerate metadata for groups that have a creation event but
