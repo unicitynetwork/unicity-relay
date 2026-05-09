@@ -762,18 +762,25 @@ func (g *GroupStore) UpdateMembersList(h string) error {
 		Tags:      tags,
 	}
 
-	if err := g.Events.SignAndStoreEvent(&event, true); err != nil {
-		return err
-	}
-	// We just published a fresh 39002 derived from the current
-	// in-memory state, so for this group the cache IS authoritative
-	// from this point on. Mark fully loaded — IsMember can now use
-	// the cache for h instead of falling back to the DB. This also
-	// handles new groups created post-WarmCaches (CreateGroup runs
-	// AddMember + ScheduleMembersListUpdate, so by the time the
-	// snapshot lands the cache is current).
-	g.membershipFullyLoaded.Store(h, struct{}{})
-	return nil
+	// NB: we deliberately do NOT mark membershipFullyLoaded here.
+	// UpdateMembersList just rewrites the on-disk 39002 from
+	// whatever the in-memory cache currently holds. If the cache
+	// was authoritative going in (fullyLoaded was already set), the
+	// rewrite is a fresh, correct snapshot — and the marker stays
+	// set. If the cache was NOT authoritative (e.g. WarmCaches
+	// missed this group's 39002 → fullyLoaded=false), promoting it
+	// here would publish a partial member list AND mark the cache
+	// authoritative, silently false-rejecting real members on
+	// future IsMember calls and persisting the wrong snapshot for
+	// the next restart's WarmCaches to consume. Issue #25 review.
+	//
+	// Authoritative-state ownership lives elsewhere:
+	//  - WarmCaches sets the marker after applying a 39002 read.
+	//  - OnEventSaved for kind-9007 (new group creation) sets it
+	//    explicitly before the first AddMember/UpdateMembersList,
+	//    because a brand-new group has no pre-existing members and
+	//    the cache trivially reflects full membership.
+	return g.Events.SignAndStoreEvent(&event, true)
 }
 
 // ScheduleMembersListUpdate publishes a fresh kind-39002 for h, debounced by

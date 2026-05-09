@@ -405,25 +405,19 @@ func TestGroupMembershipCache_AddRemove(t *testing.T) {
 
 	pk := nostr.Generate().Public()
 
+	// Mark grp2 as fully loaded for the test. Production sets this
+	// in OnEventSaved for kind-9007 (new group creation), but this
+	// artificial test bypasses that flow. Without the marker
+	// IsMember falls back to the DB, which can't deterministically
+	// order Add+Remove events that share a second's created_at.
+	groups.membershipFullyLoaded.Store("grp2", struct{}{})
+
 	groups.AddMember("grp2", pk)
-	// Production calls ScheduleMembersListUpdate after AddMember (via
-	// OnEventSaved). UpdateMembersList writes a fresh 39002 from the
-	// current cache state and marks the group as fully loaded so
-	// IsMember consults the cache instead of falling back to the DB.
-	// Without this, AddMember + RemoveMember within the same second
-	// share a created_at and the DB-fallback path can't determine
-	// the latest event from the data alone.
-	if err := groups.UpdateMembersList("grp2"); err != nil {
-		t.Fatalf("UpdateMembersList: %v", err)
-	}
 	if !groups.IsMember("grp2", pk) {
 		t.Error("IsMember should return true after AddMember")
 	}
 
 	groups.RemoveMember("grp2", pk)
-	if err := groups.UpdateMembersList("grp2"); err != nil {
-		t.Fatalf("UpdateMembersList: %v", err)
-	}
 	if groups.IsMember("grp2", pk) {
 		t.Error("IsMember should return false after RemoveMember")
 	}
