@@ -56,6 +56,9 @@ func TestInstance_PreventBroadcast(t *testing.T) {
 	chat := func(h string) nostr.Event {
 		return nostr.Event{Kind: nostr.KindSimpleGroupChatMessage, Tags: nostr.Tags{{"h", h}}}
 	}
+	membership := func(kind nostr.Kind, h string, target nostr.PubKey) nostr.Event {
+		return nostr.Event{Kind: kind, Tags: nostr.Tags{{"h", h}, {"p", target.Hex()}}}
+	}
 	note := nostr.Event{Kind: nostr.KindTextNote}
 
 	tests := []struct {
@@ -75,6 +78,9 @@ func TestInstance_PreventBroadcast(t *testing.T) {
 		{name: "hidden group metadata to group member", authed: []nostr.PubKey{member}, event: hiddenMetadata, prevent: false},
 		{name: "public group message to non-member on open relay", open: true, authed: []nostr.PubKey{outsider}, event: chat("public"), prevent: false},
 		{name: "public group message to non-member on closed relay", authed: []nostr.PubKey{outsider}, event: chat("public"), prevent: true},
+		{name: "remove-user event to the removed pubkey", authed: []nostr.PubKey{outsider}, event: membership(nostr.KindSimpleGroupRemoveUser, "private", outsider), prevent: false},
+		{name: "put-user event to the added pubkey", authed: []nostr.PubKey{outsider}, event: membership(nostr.KindSimpleGroupPutUser, "hidden", outsider), prevent: false},
+		{name: "remove-user event naming someone else to non-member", authed: []nostr.PubKey{outsider}, event: membership(nostr.KindSimpleGroupRemoveUser, "private", member), prevent: true},
 		{name: "last authenticated pubkey is not a member", authed: []nostr.PubKey{member, outsider}, event: chat("private"), prevent: true},
 		{name: "last authenticated pubkey is a member", authed: []nostr.PubKey{outsider, member}, event: chat("private"), prevent: false},
 		{name: "unauthenticated connection", open: true, event: chat("public"), prevent: true},
@@ -164,10 +170,11 @@ func TestLastAuthedPubkey_ConcurrentWithAuth(t *testing.T) {
 	}
 }
 
-// The tests below run the same scenarios end to end over websockets against a
-// relay built by MakeInstance. Each subscribes as a connection that must not
-// see an event, publishes afterwards, and checks that live delivery withholds
-// the event the same way a stored query does.
+// The tests below run end to end over websockets against a relay built by
+// MakeInstance. Each subscribes first, publishes afterwards, and checks which
+// connections the live event reaches. Subscribers never publish on the
+// connection they listen on: waiting for an OK would consume the events the
+// relay broadcasts before sending it.
 
 const broadcastWait = 2 * time.Second
 
@@ -184,9 +191,7 @@ func TestBroadcast_PrivateGroupMessageToNonMember(t *testing.T) {
 	}
 
 	outsider := dialAuthedBroadcastClient(t, url, outsiderKey)
-	if events, closed := outsider.subscribe("live", filter); closed != "" || len(events) != 0 {
-		t.Fatalf("outsider subscription: closed=%q events=%d", closed, len(events))
-	}
+	outsider.mustSubscribe("live", filter)
 
 	creator.publish(creatorKey, nostr.KindSimpleGroupChatMessage, "members only", h)
 
@@ -232,9 +237,7 @@ func TestBroadcast_HiddenGroupMetadataToNonMember(t *testing.T) {
 
 	creatorKey, outsiderKey := nostr.Generate(), nostr.Generate()
 	outsider := dialAuthedBroadcastClient(t, url, outsiderKey)
-	if events, closed := outsider.subscribe("live", filter); closed != "" || len(events) != 0 {
-		t.Fatalf("outsider subscription: closed=%q events=%d", closed, len(events))
-	}
+	outsider.mustSubscribe("live", filter)
 
 	creator := dialAuthedBroadcastClient(t, url, creatorKey)
 	creator.publish(creatorKey, nostr.KindSimpleGroupCreateGroup, `{"name":"Hidden","private":true,"hidden":true}`, h)
@@ -251,6 +254,99 @@ func TestBroadcast_HiddenGroupMetadataToNonMember(t *testing.T) {
 
 	if evt := outsider.waitEvent("live", broadcastWait); evt != nil {
 		t.Errorf("non-member received hidden group metadata live: tags=%v", evt.Tags)
+	}
+}
+
+// UpdateMetadata broadcasts the kind 39000 it writes. Readers must be judged by
+// the visibility that event sets, not by the metadata it replaces.
+func TestBroadcast_GroupMetadataOnCreateAndEdit(t *testing.T) {
+	_, url := startBroadcastTestRelay(t)
+	h := "group-" + strings.ToLower(RandomString(8))
+	filter := fmt.Sprintf(`{"kinds":[39000],"#d":[%q]}`, h)
+	creatorKey, outsiderKey := nostr.Generate(), nostr.Generate()
+	creator := dialAuthedBroadcastClient(t, url, creatorKey)
+	now := nostr.Now()
+
+	outsider := dialAuthedBroadcastClient(t, url, outsiderKey)
+	outsider.mustSubscribe("live", filter)
+
+	creator.publishEvent(creatorKey, groupEvent(nostr.KindSimpleGroupCreateGroup, now, `{"name":"Open"}`, h))
+	if evt := outsider.waitEvent("live", broadcastWait); evt == nil {
+		t.Fatal("non-member did not receive the metadata of a new public group")
+	}
+
+	creator.publishEvent(creatorKey, groupEvent(nostr.KindSimpleGroupEditMetadata, now+1, `{"name":"Hidden","private":true,"hidden":true}`, h))
+	if evt := outsider.waitEvent("live", broadcastWait); evt != nil {
+		t.Errorf("non-member received the metadata of a group that was just hidden: tags=%v", evt.Tags)
+	}
+
+	visible := dialAuthedBroadcastClient(t, url, outsiderKey)
+	visible.mustSubscribe("live", filter)
+
+	creator.publishEvent(creatorKey, groupEvent(nostr.KindSimpleGroupEditMetadata, now+2, `{"name":"Visible"}`, h))
+	if evt := visible.waitEvent("live", broadcastWait); evt == nil {
+		t.Error("non-member did not receive the metadata of a group that was made visible")
+	}
+}
+
+// Membership changes before the put-user or remove-user event is broadcast:
+// GroupStore.AddMember publishes the put-user for a join first and updates the
+// cache after, while OnEventSaved applies a removal before khatru broadcasts it.
+// The user the event names must receive it either way.
+func TestBroadcast_MembershipEventsToAffectedUser(t *testing.T) {
+	_, url := startBroadcastTestRelay(t)
+	h := "private-" + strings.ToLower(RandomString(8))
+	creatorKey, userKey := nostr.Generate(), nostr.Generate()
+	user := userKey.Public()
+	now := nostr.Now()
+
+	creator := dialAuthedBroadcastClient(t, url, creatorKey)
+	creator.publishEvent(creatorKey, groupEvent(nostr.KindSimpleGroupCreateGroup, now, `{"name":"Secret","private":true}`, h))
+	creator.publishEvent(creatorKey, groupEvent(nostr.KindSimpleGroupCreateInvite, now, "", h, nostr.Tag{"code", "letmein"}))
+
+	subscriber := dialAuthedBroadcastClient(t, url, userKey)
+	subscriber.mustSubscribe("membership", fmt.Sprintf(`{"kinds":[9000,9001],"#h":[%q]}`, h))
+
+	dialAuthedBroadcastClient(t, url, userKey).publishEvent(userKey, groupEvent(nostr.KindSimpleGroupJoinRequest, now, "", h, nostr.Tag{"code", "letmein"}))
+	if evt := subscriber.waitEvent("membership", broadcastWait); evt == nil || evt.Kind != nostr.KindSimpleGroupPutUser || evt.Tags.FindWithValue("p", user.Hex()) == nil {
+		t.Fatalf("joining user did not receive the put-user event naming them, got %v", evt)
+	}
+
+	creator.publishEvent(creatorKey, groupEvent(nostr.KindSimpleGroupRemoveUser, now+1, "", h, nostr.Tag{"p", user.Hex()}))
+	if evt := subscriber.waitEvent("membership", broadcastWait); evt == nil || evt.Kind != nostr.KindSimpleGroupRemoveUser {
+		t.Fatalf("removed user did not receive the remove-user event naming them, got %v", evt)
+	}
+}
+
+// OnEventSaved deletes the group, including the metadata and membership CanRead
+// needs, before khatru broadcasts the deletion. Members must still receive it
+// exactly once, and non-members of a hidden group must not.
+func TestBroadcast_GroupDeletionToMembers(t *testing.T) {
+	_, url := startBroadcastTestRelay(t)
+	h := "hidden-" + strings.ToLower(RandomString(8))
+	filter := fmt.Sprintf(`{"kinds":[9008],"#h":[%q]}`, h)
+	creatorKey, memberKey, outsiderKey := nostr.Generate(), nostr.Generate(), nostr.Generate()
+	now := nostr.Now()
+
+	creator := dialAuthedBroadcastClient(t, url, creatorKey)
+	creator.publishEvent(creatorKey, groupEvent(nostr.KindSimpleGroupCreateGroup, now, `{"name":"Hidden","private":true,"hidden":true}`, h))
+	creator.publishEvent(creatorKey, groupEvent(nostr.KindSimpleGroupPutUser, now, "", h, nostr.Tag{"p", memberKey.Public().Hex()}))
+
+	member := dialAuthedBroadcastClient(t, url, memberKey)
+	member.mustSubscribe("live", filter)
+	outsider := dialAuthedBroadcastClient(t, url, outsiderKey)
+	outsider.mustSubscribe("live", filter)
+
+	creator.publishEvent(creatorKey, groupEvent(nostr.KindSimpleGroupDeleteGroup, now+1, "", h))
+
+	if evt := member.waitEvent("live", broadcastWait); evt == nil {
+		t.Fatal("member did not receive the group deletion")
+	}
+	if evt := member.waitEvent("live", broadcastWait); evt != nil {
+		t.Error("member received the group deletion twice")
+	}
+	if evt := outsider.waitEvent("live", broadcastWait); evt != nil {
+		t.Error("non-member received the deletion of a hidden group")
 	}
 }
 
@@ -293,6 +389,15 @@ auto_join = true
 	t.Cleanup(server.Close)
 
 	return instance, "ws" + strings.TrimPrefix(server.URL, "http")
+}
+
+func groupEvent(kind nostr.Kind, createdAt nostr.Timestamp, content, h string, extra ...nostr.Tag) nostr.Event {
+	return nostr.Event{
+		Kind:      kind,
+		CreatedAt: createdAt,
+		Tags:      append(nostr.Tags{{"h", h}}, extra...),
+		Content:   content,
+	}
 }
 
 type broadcastClient struct {
@@ -391,12 +496,13 @@ func (c *broadcastClient) expectOK(id nostr.ID) {
 
 func (c *broadcastClient) publish(secret nostr.SecretKey, kind nostr.Kind, content, h string) {
 	c.t.Helper()
-	evt := nostr.Event{
-		Kind:      kind,
-		CreatedAt: nostr.Now(),
-		Tags:      nostr.Tags{{"h", h}},
-		Content:   content,
-	}
+	c.publishEvent(secret, groupEvent(kind, nostr.Now(), content, h))
+}
+
+// publishEvent signs evt, sends it and waits for an accepted OK, discarding
+// anything else the connection receives in the meantime.
+func (c *broadcastClient) publishEvent(secret nostr.SecretKey, evt nostr.Event) {
+	c.t.Helper()
 	if err := evt.Sign(secret); err != nil {
 		c.t.Fatal(err)
 	}
@@ -434,6 +540,15 @@ func (c *broadcastClient) subscribe(id, filter string) ([]nostr.Event, string) {
 				return events, env.Reason
 			}
 		}
+	}
+}
+
+// mustSubscribe opens a subscription that is expected to be accepted with no
+// stored events.
+func (c *broadcastClient) mustSubscribe(id, filter string) {
+	c.t.Helper()
+	if events, closed := c.subscribe(id, filter); closed != "" || len(events) != 0 {
+		c.t.Fatalf("subscription %s: closed=%q stored events=%d", id, closed, len(events))
 	}
 }
 
