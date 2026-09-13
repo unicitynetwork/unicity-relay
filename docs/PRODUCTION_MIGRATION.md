@@ -25,7 +25,7 @@ docker push ghcr.io/unicitynetwork/unicity-relay:pg-migration
 
 Create `Dockerfile.migrate` in the repo root:
 ```dockerfile
-FROM golang:1.24 AS build
+FROM golang:1.25 AS build
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download

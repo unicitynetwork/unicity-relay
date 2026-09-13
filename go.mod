@@ -1,9 +1,9 @@
 module zooid
 
-go 1.24.1
+go 1.25
 
 require (
-	fiatjaf.com/nostr v0.0.0-20251104112613-38a6ca92b954
+	fiatjaf.com/nostr v0.0.0-20251216162153-bdef5ac224d5
 	github.com/BurntSushi/toml v1.5.0
 	github.com/Masterminds/squirrel v1.5.4
 	github.com/coder/websocket v1.8.13
@@ -87,6 +87,8 @@ require (
 	github.com/shirou/gopsutil/v4 v4.25.6 // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
 	github.com/stretchr/testify v1.11.1 // indirect
+	github.com/templexxx/cpu v0.0.1 // indirect
+	github.com/templexxx/xhex v0.0.0-20200614015412-aed53437177b // indirect
 	github.com/tidwall/gjson v1.18.0 // indirect
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.1 // indirect
