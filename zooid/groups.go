@@ -596,6 +596,12 @@ func (g *GroupStore) RefreshMemberCount(h string) error {
 // Deletion
 
 func (g *GroupStore) DeleteGroup(h string) {
+	// CanRead lets anyone read the kind 9008 of a group that no longer exists.
+	// For a hidden group that would reveal it existed, so delete that event too;
+	// members connected at the time still receive it live.
+	meta, _ := g.GetMetadata(h)
+	hidden := HasTag(meta.Tags, "hidden")
+
 	filters := []nostr.Filter{
 		{
 			Kinds: nip29.MetadataEventKinds,
@@ -614,7 +620,7 @@ func (g *GroupStore) DeleteGroup(h string) {
 		// Collect IDs first to avoid holding the DB connection during deletion
 		var toDelete []nostr.ID
 		for event := range g.Events.QueryEvents(filter, 0) {
-			if event.Kind != nostr.KindSimpleGroupDeleteGroup {
+			if event.Kind != nostr.KindSimpleGroupDeleteGroup || hidden {
 				toDelete = append(toDelete, event.ID)
 			}
 		}
@@ -1165,8 +1171,19 @@ func (g *GroupStore) CanRead(pubkey nostr.PubKey, event nostr.Event) bool {
 
 	meta, found := g.GetMetadata(h)
 
+	// DeleteGroup keeps a group's kind 9008, except for hidden groups, so
+	// clients that were offline can still learn that the group is gone.
 	if !found {
-		return false
+		return event.Kind == nostr.KindSimpleGroupDeleteGroup
+	}
+
+	// A put-user or remove-user event is readable by the pubkey it names, so a
+	// user removed from a private or hidden group can still find the removal.
+	// Membership also changes on either side of the broadcast of such an event
+	// (GroupStore.AddMember, OnEventSaved).
+	if (event.Kind == nostr.KindSimpleGroupPutUser || event.Kind == nostr.KindSimpleGroupRemoveUser) &&
+		event.Tags.FindWithValue("p", pubkey.Hex()) != nil {
+		return true
 	}
 
 	if HasTag(meta.Tags, "hidden") && !g.HasAccess(h, pubkey) {

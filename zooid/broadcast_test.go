@@ -90,6 +90,7 @@ func TestInstance_PreventBroadcast(t *testing.T) {
 		{name: "relay-level admin list", authed: []nostr.PubKey{outsider}, event: nostr.Event{Kind: nostr.KindSimpleGroupAdmins, Tags: nostr.Tags{{"d", "_"}}}, prevent: false},
 		{name: "write-only event", authed: []nostr.PubKey{member}, event: nostr.Event{Kind: RELAY_JOIN}, prevent: true},
 		{name: "group members list", authed: []nostr.PubKey{member}, event: nostr.Event{Kind: nostr.KindSimpleGroupMembers, Tags: nostr.Tags{{"d", "public"}}}, prevent: true},
+		{name: "deletion of a group that no longer exists", open: true, authed: []nostr.PubKey{member}, event: nostr.Event{Kind: nostr.KindSimpleGroupDeleteGroup, Tags: nostr.Tags{{"h", "deleted"}}}, prevent: true},
 	}
 
 	for _, tt := range tests {
