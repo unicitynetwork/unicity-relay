@@ -184,7 +184,7 @@ func (instance *Instance) Cleanup() {
 // Utility methods
 
 func (instance *Instance) StripSignature(ctx context.Context, event nostr.Event) nostr.Event {
-	pubkey, _ := khatru.GetAuthed(ctx)
+	pubkey, _ := getAuthed(ctx)
 
 	if instance.Config.Policy.StripSignatures && !instance.Config.CanManage(pubkey) {
 		var zeroSig [64]byte
@@ -343,7 +343,7 @@ func (instance *Instance) DeleteEvent(ctx context.Context, id nostr.ID) error {
 // Requests
 
 func (instance *Instance) OnRequest(ctx context.Context, filter nostr.Filter) (reject bool, msg string) {
-	pubkey, ok := khatru.GetAuthed(ctx)
+	pubkey, ok := getAuthed(ctx)
 
 	if !ok {
 		return true, "auth-required: authentication is required for access"
@@ -366,7 +366,7 @@ func (instance *Instance) QueryStored(ctx context.Context, filter nostr.Filter) 
 				}
 			}
 		} else {
-			pubkey, _ := khatru.GetAuthed(ctx)
+			pubkey, _ := getAuthed(ctx)
 			generated := make([]nostr.Event, 0)
 
 			if slices.Contains(filter.Kinds, RELAY_INVITE) && instance.Config.CanInvite(pubkey) {
@@ -417,7 +417,7 @@ func (instance *Instance) OnEvent(ctx context.Context, event nostr.Event) (rejec
 		return false, ""
 	}
 
-	pubkey, isAuthenticated := khatru.GetAuthed(ctx)
+	pubkey, isAuthenticated := getAuthed(ctx)
 
 	if !isAuthenticated {
 		return true, "auth-required: authentication is required for access"
