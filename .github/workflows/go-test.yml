@@ -40,3 +40,12 @@ jobs:
           # and disabling avoids a class of intermittent CI flakes.
           TESTCONTAINERS_RYUK_DISABLED: "true"
         run: go test ./...
+
+      # The full suite under -race reports data races inside khatru's listener
+      # bookkeeping (notifyListeners reads the listener list without taking
+      # clientsMutex), which zooid cannot fix, so only zooid's own concurrency
+      # tests run with the race detector.
+      - name: Run concurrency tests with the race detector
+        env:
+          TESTCONTAINERS_RYUK_DISABLED: "true"
+        run: go test -race -run 'TestAuth_ConcurrentDuplicateAuth$|TestLastAuthedPubkey_ConcurrentWithAuth$|TestInstance_PreventBroadcast$' ./zooid/
