@@ -107,12 +107,13 @@ func TestInstance_PreventBroadcast(t *testing.T) {
 
 // khatru's AUTH handler changes AuthedPublicKeys under WebSocket.authLock.
 // Under -race this fails if lastAuthedPubkey reads the slice without that lock
-// while AUTH messages are being handled.
+// while AUTH messages are being handled. It also checks that getAuthed resolves
+// a connection's context through lastAuthedPubkey.
 func TestLastAuthedPubkey_ConcurrentWithAuth(t *testing.T) {
 	relay := khatru.NewRelay()
-	connections := make(chan *khatru.WebSocket, 1)
+	contexts := make(chan context.Context, 1)
 	relay.OnConnect = func(ctx context.Context) {
-		connections <- khatru.GetConnection(ctx)
+		contexts <- ctx
 		khatru.RequestAuth(ctx)
 	}
 
@@ -121,7 +122,8 @@ func TestLastAuthedPubkey_ConcurrentWithAuth(t *testing.T) {
 	url := "ws" + strings.TrimPrefix(server.URL, "http")
 
 	client := dialBroadcastClient(t, url)
-	ws := <-connections
+	connCtx := <-contexts
+	ws := khatru.GetConnection(connCtx)
 
 	env, ok := client.next(5 * time.Second)
 	challenge, isAuth := env.(*nostr.AuthEnvelope)
@@ -167,6 +169,12 @@ func TestLastAuthedPubkey_ConcurrentWithAuth(t *testing.T) {
 
 	if got, ok := lastAuthedPubkey(ws); !ok || got != last {
 		t.Errorf("lastAuthedPubkey() = %s, %v; want %s", got.Hex(), ok, last.Hex())
+	}
+	if got, ok := getAuthed(connCtx); !ok || got != last {
+		t.Errorf("getAuthed() on the connection = %s, %v; want %s", got.Hex(), ok, last.Hex())
+	}
+	if _, ok := getAuthed(context.Background()); ok {
+		t.Error("getAuthed() without a connection reported an authenticated pubkey")
 	}
 }
 
