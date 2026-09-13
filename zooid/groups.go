@@ -518,7 +518,9 @@ func (g *GroupStore) UpdateMetadata(event nostr.Event) error {
 		Content:   event.Content, // Include metadata JSON (name, about, picture, etc.)
 	}
 
-	if err := g.Events.SignAndStoreEvent(&metadataEvent, true); err != nil {
+	// PreventBroadcast decides who receives this event from the cached
+	// metadata, so update the cache before broadcasting.
+	if err := g.Events.SignAndStoreEvent(&metadataEvent, false); err != nil {
 		return err
 	}
 
@@ -532,6 +534,8 @@ func (g *GroupStore) UpdateMetadata(event nostr.Event) error {
 			writeRestricted: HasTag(tags, "write-restricted"),
 		})
 	}
+
+	g.Events.Relay.BroadcastEvent(metadataEvent)
 
 	return nil
 }
