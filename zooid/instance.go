@@ -289,8 +289,34 @@ func (instance *Instance) OnConnect(ctx context.Context) {
 	khatru.RequestAuth(ctx)
 }
 
+// PreventBroadcast applies to live events the checks a REQ from the listening
+// connection gets from OnRequest and QueryStored. khatru calls it for every
+// listener whose filter matches, so without these checks a subscription would
+// receive events its connection cannot query, such as messages from private
+// groups it is not a member of.
 func (instance *Instance) PreventBroadcast(ws *khatru.WebSocket, filter nostr.Filter, event nostr.Event) bool {
-	return instance.IsWriteOnlyEvent(event) || isLargeListEvent(event)
+	if instance.IsWriteOnlyEvent(event) || isLargeListEvent(event) {
+		return true
+	}
+
+	pubkey, authenticated := lastAuthedPubkey(ws)
+	if !authenticated {
+		return true
+	}
+
+	if !instance.Config.Policy.Open && !instance.Management.IsMember(pubkey) {
+		return true
+	}
+
+	if event.Kind == RELAY_INVITE || instance.IsInternalEvent(event) {
+		return true
+	}
+
+	if instance.Groups.IsGroupEvent(event) && !instance.Groups.CanRead(pubkey, event) {
+		return true
+	}
+
+	return false
 }
 
 func (instance *Instance) StoreEvent(ctx context.Context, event nostr.Event) error {
