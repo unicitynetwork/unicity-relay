@@ -1,6 +1,6 @@
 # Zooid (Unicity Fork)
 
-This is a fork of [Zooid](https://github.com/coracle-social/zooid), a multi-tenant relay based on [Khatru](https://gitworkshop.dev/fiatjaf.com/nostrlib/tree/master/khatru) which implements a range of access controls. This fork is customized for use with [Unicity Sphere](https://github.com/unicitylabs/sphere) for NIP-29 group chat functionality.
+This is a fork of [Zooid](https://gitea.coracle.social/coracle/zooid), a multi-tenant relay based on [Khatru](https://gitworkshop.dev/fiatjaf.com/nostrlib/tree/master/khatru) which implements a range of access controls. This fork is customized for use with [Unicity Sphere](https://github.com/unicitylabs/sphere) for NIP-29 group chat functionality.
 
 ## Unicity Fork Modifications
 
@@ -206,7 +206,7 @@ podman run -it \
   -e DATABASE_URL="postgres://zooid:password@db-host:5432/zooid?sslmode=verify-full" \
   -v ./config:/app/config \
   -v ./media:/app/media \
-  ghcr.io/coracle-social/zooid
+  ghcr.io/unicitynetwork/unicity-relay
 ```
 
 ## Running with Unicity Sphere
