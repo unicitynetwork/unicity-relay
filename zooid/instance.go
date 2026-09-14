@@ -308,6 +308,10 @@ func (instance *Instance) PreventBroadcast(ws *khatru.WebSocket, filter nostr.Fi
 		return true
 	}
 
+	if instance.Management.PubkeyIsBanned(pubkey) {
+		return true
+	}
+
 	if event.Kind == RELAY_INVITE || instance.IsInternalEvent(event) {
 		return true
 	}
@@ -347,6 +351,10 @@ func (instance *Instance) OnRequest(ctx context.Context, filter nostr.Filter) (r
 
 	if !ok {
 		return true, "auth-required: authentication is required for access"
+	}
+
+	if instance.Management.PubkeyIsBanned(pubkey) {
+		return true, "restricted: you have been banned from this relay"
 	}
 
 	// If open policy, allow all authenticated users; otherwise require membership
@@ -413,6 +421,16 @@ func (instance *Instance) QueryStored(ctx context.Context, filter nostr.Filter) 
 // Event publishing
 
 func (instance *Instance) OnEvent(ctx context.Context, event nostr.Event) (reject bool, msg string) {
+	// Check bans before the recipient shortcut below, which accepts zap
+	// receipts and gift wraps without authenticating their author.
+	if instance.Management.EventIsBanned(event.ID) {
+		return true, "restricted: this event has been banned from this relay"
+	}
+
+	if instance.Management.PubkeyIsBanned(event.PubKey) {
+		return true, "restricted: event author has been banned from this relay"
+	}
+
 	if instance.AllowRecipientEvent(event) {
 		return false, ""
 	}
@@ -446,10 +464,6 @@ func (instance *Instance) OnEvent(ctx context.Context, event nostr.Event) (rejec
 		if err := instance.Groups.CheckWrite(event); err != "" {
 			return true, err
 		}
-	}
-
-	if instance.Management.EventIsBanned(event.ID) {
-		return true, "restricted: this event has been banned from this relay"
 	}
 
 	return false, ""
