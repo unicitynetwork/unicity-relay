@@ -207,7 +207,7 @@ func TestEventStore_QueryEvents_ByTags(t *testing.T) {
 		t.Error("QueryEvents() by tags returned wrong event")
 	}
 
-	// Test that non-single-character tags are ignored
+	// Test that multi-character tag keys match nothing
 	event3 := nostr.Event{
 		Kind:      nostr.KindTextNote,
 		CreatedAt: nostr.Now(),
@@ -217,16 +217,16 @@ func TestEventStore_QueryEvents_ByTags(t *testing.T) {
 	event3.Sign(nostr.Generate())
 	store.SaveEvent(event3)
 
-	// Query by multi-character tag key should ignore the tag filter and return all events
-	// (because multi-character tags are skipped in buildSelectQuery)
+	// Only single-letter tags are indexed, so a multi-character tag key matches
+	// no event rather than being dropped from the query
 	filter = nostr.Filter{Tags: nostr.TagMap{"title": []string{"special"}}}
 	events = make([]nostr.Event, 0)
 	for evt := range store.QueryEvents(filter, 0) {
 		events = append(events, evt)
 	}
 
-	if len(events) != 3 {
-		t.Errorf("QueryEvents() with multi-character tag key should ignore tag filter and return all 3 events, got %d", len(events))
+	if len(events) != 0 {
+		t.Errorf("QueryEvents() with multi-character tag key returned %d events, want 0", len(events))
 	}
 }
 

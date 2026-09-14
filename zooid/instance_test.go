@@ -165,6 +165,16 @@ func TestInstance_GenerateInviteEvent(t *testing.T) {
 	if pTag == nil || pTag[1] != userPubkey.Hex() {
 		t.Error("GenerateInviteEvent() should have correct p tag")
 	}
+
+	if again := instance.GenerateInviteEvent(userPubkey); again.ID != inviteEvent.ID {
+		t.Error("GenerateInviteEvent() should reuse the invite it created for the same pubkey")
+	}
+
+	otherPubkey := nostr.Generate().Public()
+	otherInvite := instance.GenerateInviteEvent(otherPubkey)
+	if pTag := otherInvite.Tags.Find("p"); pTag == nil || pTag[1] != otherPubkey.Hex() {
+		t.Error("GenerateInviteEvent() should return an invite for the pubkey it was asked about")
+	}
 }
 
 func TestInstance_IsInternalEvent(t *testing.T) {

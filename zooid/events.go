@@ -301,9 +301,16 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) (squirrel.Select
 		key    string
 		values []interface{}
 	}
+	// A nil slice means the field was absent from the filter and places no
+	// constraint. A present but empty list ("ids":[]), or a tag key that
+	// saveEventWith never indexes because it is not a single letter, is a
+	// constraint no event satisfies; skipping it would widen the query to
+	// every event instead.
+	matchesNothing := false
 	var tagFilters []tagFilter
 	for tagKey, tagValues := range filter.Tags {
 		if len(tagValues) == 0 || len(tagKey) != 1 {
+			matchesNothing = true
 			continue
 		}
 		vals := make([]interface{}, len(tagValues))
@@ -321,7 +328,7 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) (squirrel.Select
 	// critical for hot groups whose tag rows are dominated by membership
 	// events, see issue #23) and on the outer events query.
 	var kindInts []interface{}
-	if len(filter.Kinds) > 0 {
+	if filter.Kinds != nil {
 		kindInts = make([]interface{}, len(filter.Kinds))
 		for i, k := range filter.Kinds {
 			kindInts[i] = int(k)
@@ -395,7 +402,8 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) (squirrel.Select
 		qb = qb.Where(col+"search_vector @@ plainto_tsquery('english', ?)", filter.Search)
 	}
 
-	if len(filter.IDs) > 0 {
+	// squirrel renders Eq with an empty list as (1=0).
+	if filter.IDs != nil {
 		idStrs := make([]interface{}, len(filter.IDs))
 		for i, id := range filter.IDs {
 			idStrs[i] = id.Hex()
@@ -403,7 +411,7 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) (squirrel.Select
 		qb = qb.Where(squirrel.Eq{col + "id": idStrs})
 	}
 
-	if len(filter.Authors) > 0 {
+	if filter.Authors != nil {
 		authorStrs := make([]interface{}, len(filter.Authors))
 		for i, author := range filter.Authors {
 			authorStrs[i] = author.Hex()
@@ -411,8 +419,12 @@ func (events *EventStore) buildSelectQuery(filter nostr.Filter) (squirrel.Select
 		qb = qb.Where(squirrel.Eq{col + "pubkey": authorStrs})
 	}
 
-	if len(kindInts) > 0 {
+	if kindInts != nil {
 		qb = qb.Where(squirrel.Eq{col + "kind": kindInts})
+	}
+
+	if matchesNothing {
+		qb = qb.Where("1=0")
 	}
 
 	if filter.Since != 0 {
