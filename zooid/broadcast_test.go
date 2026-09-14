@@ -80,6 +80,7 @@ func TestInstance_PreventBroadcast(t *testing.T) {
 		{name: "public group message to non-member on closed relay", authed: []nostr.PubKey{outsider}, event: chat("public"), prevent: true},
 		{name: "remove-user event to the removed pubkey", authed: []nostr.PubKey{outsider}, event: membership(nostr.KindSimpleGroupRemoveUser, "private", outsider), prevent: false},
 		{name: "put-user event to the added pubkey", authed: []nostr.PubKey{outsider}, event: membership(nostr.KindSimpleGroupPutUser, "hidden", outsider), prevent: false},
+		{name: "put-user event to the added pubkey before the group's metadata exists", authed: []nostr.PubKey{outsider}, event: membership(nostr.KindSimpleGroupPutUser, "new", outsider), prevent: false},
 		{name: "remove-user event naming someone else to non-member", authed: []nostr.PubKey{outsider}, event: membership(nostr.KindSimpleGroupRemoveUser, "private", member), prevent: true},
 		{name: "last authenticated pubkey is not a member", authed: []nostr.PubKey{member, outsider}, event: chat("private"), prevent: true},
 		{name: "last authenticated pubkey is a member", authed: []nostr.PubKey{outsider, member}, event: chat("private"), prevent: false},
@@ -323,6 +324,23 @@ func TestBroadcast_MembershipEventsToAffectedUser(t *testing.T) {
 	creator.publishEvent(creatorKey, groupEvent(nostr.KindSimpleGroupRemoveUser, now+1, "", h, nostr.Tag{"p", user.Hex()}))
 	if evt := subscriber.waitEvent("membership", broadcastWait); evt == nil || evt.Kind != nostr.KindSimpleGroupRemoveUser {
 		t.Fatalf("removed user did not receive the remove-user event naming them, got %v", evt)
+	}
+}
+
+// When a group is created, OnEventSaved adds the creator with AddMember, which
+// broadcasts the put-user event naming them before UpdateMetadata stores the
+// group's metadata. The creator must still receive it.
+func TestBroadcast_CreatorReceivesOwnPutUser(t *testing.T) {
+	_, url := startBroadcastTestRelay(t)
+	h := "private-" + strings.ToLower(RandomString(8))
+	creatorKey := nostr.Generate()
+
+	subscriber := dialAuthedBroadcastClient(t, url, creatorKey)
+	subscriber.mustSubscribe("membership", fmt.Sprintf(`{"kinds":[9000],"#h":[%q]}`, h))
+
+	dialAuthedBroadcastClient(t, url, creatorKey).publishEvent(creatorKey, groupEvent(nostr.KindSimpleGroupCreateGroup, nostr.Now(), `{"name":"Secret","private":true}`, h))
+	if evt := subscriber.waitEvent("membership", broadcastWait); evt == nil || evt.Tags.FindWithValue("p", creatorKey.Public().Hex()) == nil {
+		t.Fatalf("creator did not receive the put-user event naming them, got %v", evt)
 	}
 }
 

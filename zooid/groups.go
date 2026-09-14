@@ -1163,19 +1163,20 @@ func (g *GroupStore) CanRead(pubkey nostr.PubKey, event nostr.Event) bool {
 		return true
 	}
 
+	// A put-user or remove-user event is readable by the pubkey it names, so a
+	// user removed from a private or hidden group can still find the removal.
+	// Membership also changes on either side of the broadcast of such an event
+	// (GroupStore.AddMember, OnEventSaved), and a new group's first put-user,
+	// naming its creator, is broadcast before the group's metadata is stored.
+	if (event.Kind == nostr.KindSimpleGroupPutUser || event.Kind == nostr.KindSimpleGroupRemoveUser) &&
+		event.Tags.FindWithValue("p", pubkey.Hex()) != nil {
+		return true
+	}
+
 	meta, found := g.GetMetadata(h)
 
 	if !found {
 		return false
-	}
-
-	// A put-user or remove-user event is readable by the pubkey it names, so a
-	// user removed from a private or hidden group can still find the removal.
-	// Membership also changes on either side of the broadcast of such an event
-	// (GroupStore.AddMember, OnEventSaved).
-	if (event.Kind == nostr.KindSimpleGroupPutUser || event.Kind == nostr.KindSimpleGroupRemoveUser) &&
-		event.Tags.FindWithValue("p", pubkey.Hex()) != nil {
-		return true
 	}
 
 	if HasTag(meta.Tags, "hidden") && !g.HasAccess(h, pubkey) {
