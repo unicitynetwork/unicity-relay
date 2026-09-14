@@ -92,6 +92,24 @@ func LoadConfig(filename string) (*Config, error) {
 		return nil, err
 	}
 
+	// GetOwner decodes info.pubkey, and GetAdmins the pubkeys of roles that can
+	// manage the relay, with MustPubKeyFromHex, which panics on a missing or
+	// malformed key and takes down every relay in the process, including on
+	// hot reload.
+	if _, err := nostr.PubKeyFromHex(config.Info.Pubkey); err != nil {
+		return nil, fmt.Errorf("info.pubkey in %s must be a hex public key: %w", path, err)
+	}
+	for name, role := range config.Roles {
+		if !role.CanManage {
+			continue
+		}
+		for _, pubkey := range role.Pubkeys {
+			if _, err := nostr.PubKeyFromHex(pubkey); err != nil {
+				return nil, fmt.Errorf("roles.%s.pubkeys in %s must be hex public keys: %w", name, path, err)
+			}
+		}
+	}
+
 	// Save the path for later
 	config.path = path
 
