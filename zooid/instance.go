@@ -341,8 +341,13 @@ func (instance *Instance) broadcastLifecycleEvent(event nostr.Event) {
 	instance.Groups.lifecycleBroadcasts.Delete(event.ID)
 }
 
+// StoreEvent reports an event that is already stored as eventstore.ErrDupEvent,
+// so khatru neither runs OnEventSaved nor broadcasts the event again. A client
+// can send the same event twice, over two connections or as a retry, and both
+// copies can pass OnEvent before either is stored. khatru calls StoreEvent only
+// for regular events; replaceable ones go through ReplaceEvent.
 func (instance *Instance) StoreEvent(ctx context.Context, event nostr.Event) error {
-	return instance.Events.StoreEvent(event)
+	return instance.Events.SaveEvent(event)
 }
 
 func (instance *Instance) ReplaceEvent(ctx context.Context, event nostr.Event) error {
@@ -610,9 +615,10 @@ func (instance *Instance) OnEventSaved(ctx context.Context, event nostr.Event) {
 	if event.Kind == nostr.KindSimpleGroupDeleteGroup {
 		// Creations and deletions of a group are applied one at a time. A
 		// deletion is dropped instead of applied when its group is already
-		// gone, because another deletion of it was applied first, or when the
-		// group was recreated after OnEvent accepted the deletion. Applying it
-		// would delete the recreated group, and keeping its event would leave
+		// gone, because another deletion of it was applied first, when the
+		// group was recreated after OnEvent accepted the deletion, or when
+		// another copy of the same event was already applied. Applying it
+		// could delete a recreated group, and keeping its event would leave
 		// a kind 9008 that CanRead returns to anyone, which for a hidden group
 		// reveals that the group existed.
 		instance.Groups.deletionMu.Lock()

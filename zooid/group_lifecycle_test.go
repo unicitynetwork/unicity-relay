@@ -9,8 +9,8 @@ import (
 	"fiatjaf.com/nostr"
 )
 
-// Two deletions of the same group can both pass CheckWrite before either is
-// applied. The one handled second finds the group already gone and must not
+// Two deletions of the same group can both pass OnEvent's checks before either
+// is applied. The one handled second finds the group already gone and must not
 // leave its kind 9008 behind: CanRead would expose it for a hidden group, and
 // for any group it would be a second deletion notice.
 func TestOnEventSaved_DuplicateGroupDeletion(t *testing.T) {
@@ -31,9 +31,14 @@ func TestOnEventSaved_DuplicateGroupDeletion(t *testing.T) {
 			now := nostr.Now()
 
 			saveAndHandle(t, instance, creator, groupEvent(nostr.KindSimpleGroupCreateGroup, now, tt.content, h))
-			saveAndHandle(t, instance, creator, groupEvent(nostr.KindSimpleGroupDeleteGroup, now+1, "", h))
+			first := signedEvent(t, creator, groupEvent(nostr.KindSimpleGroupDeleteGroup, now+1, "", h))
+			second := signedEvent(t, creator, groupEvent(nostr.KindSimpleGroupDeleteGroup, now+2, "", h))
+			acceptGroupEvent(t, instance, first)
+			acceptGroupEvent(t, instance, second)
+
+			storeAndHandle(t, instance, first)
 			// The second deletion is stored after the first has been applied.
-			saveAndHandle(t, instance, creator, groupEvent(nostr.KindSimpleGroupDeleteGroup, now+2, "", h))
+			storeAndHandle(t, instance, second)
 
 			if n := storedGroupEvents(t, instance, nostr.KindSimpleGroupDeleteGroup, h); n != tt.want {
 				t.Errorf("stored deletion events = %d, want %d", n, tt.want)
@@ -76,11 +81,8 @@ func TestOnEventSaved_StaleDeletionSparesRecreatedGroup(t *testing.T) {
 	// group exists.
 	first := signedEvent(t, creator, groupEvent(nostr.KindSimpleGroupDeleteGroup, now+1, "", h))
 	second := signedEvent(t, creator, groupEvent(nostr.KindSimpleGroupDeleteGroup, now+2, "", h))
-	for _, evt := range []nostr.Event{first, second} {
-		if reason := instance.Groups.CheckDeletion(evt); reason != "" {
-			t.Fatalf("CheckDeletion rejected a deletion: %s", reason)
-		}
-	}
+	acceptGroupEvent(t, instance, first)
+	acceptGroupEvent(t, instance, second)
 
 	storeAndHandle(t, instance, first)
 	saveAndHandle(t, instance, creator, groupEvent(nostr.KindSimpleGroupCreateGroup, now+3, `{"name":"Second"}`, h))
@@ -106,17 +108,12 @@ func TestOnEventSaved_DuplicateGroupCreation(t *testing.T) {
 
 	first := signedEvent(t, firstKey, groupEvent(nostr.KindSimpleGroupCreateGroup, now, `{"name":"First"}`, h))
 	second := signedEvent(t, secondKey, groupEvent(nostr.KindSimpleGroupCreateGroup, now, `{"name":"Second"}`, h))
-	for _, evt := range []nostr.Event{first, second} {
-		if reason := instance.Groups.CheckWrite(evt); reason != "" {
-			t.Fatalf("CheckWrite rejected a creation: %s", reason)
-		}
-	}
+	acceptGroupEvent(t, instance, first)
+	acceptGroupEvent(t, instance, second)
 
 	storeAndHandle(t, instance, first)
 	deletion := signedEvent(t, firstKey, groupEvent(nostr.KindSimpleGroupDeleteGroup, now+1, "", h))
-	if reason := instance.Groups.CheckDeletion(deletion); reason != "" {
-		t.Fatalf("CheckDeletion rejected the deletion: %s", reason)
-	}
+	acceptGroupEvent(t, instance, deletion)
 	storeAndHandle(t, instance, second)
 
 	if creator := instance.Groups.GetGroupCreator(h); creator != firstKey.Public() {
@@ -129,6 +126,78 @@ func TestOnEventSaved_DuplicateGroupCreation(t *testing.T) {
 	storeAndHandle(t, instance, deletion)
 	if _, found := instance.Groups.GetMetadata(h); found {
 		t.Error("the deletion accepted for the group was not applied")
+	}
+}
+
+// A client can send the same event again, over another connection or as a
+// retry, before the relay has applied it, so both copies pass OnEvent. Only one
+// copy may be applied, and the other must not remove the event it stored.
+func TestOnEventSaved_DuplicateDelivery(t *testing.T) {
+	t.Run("creation", func(t *testing.T) {
+		instance := createTestInstance()
+		creator := nostr.Generate()
+		h := "group-" + strings.ToLower(RandomString(8))
+
+		creation := signedEvent(t, creator, groupEvent(nostr.KindSimpleGroupCreateGroup, nostr.Now(), `{"name":"Group"}`, h))
+		acceptGroupEvent(t, instance, creation)
+		acceptGroupEvent(t, instance, creation)
+		storeAndHandle(t, instance, creation)
+		storeAndHandle(t, instance, creation)
+
+		// WarmCaches restores the group's creator from this event on startup.
+		if n := storedGroupEvents(t, instance, nostr.KindSimpleGroupCreateGroup, h); n != 1 {
+			t.Errorf("stored creation events = %d, want 1", n)
+		}
+	})
+
+	t.Run("deletion", func(t *testing.T) {
+		instance := createTestInstance()
+		creator := nostr.Generate()
+		h := "group-" + strings.ToLower(RandomString(8))
+		now := nostr.Now()
+
+		saveAndHandle(t, instance, creator, groupEvent(nostr.KindSimpleGroupCreateGroup, now, `{"name":"Group"}`, h))
+		deletion := signedEvent(t, creator, groupEvent(nostr.KindSimpleGroupDeleteGroup, now+1, "", h))
+		acceptGroupEvent(t, instance, deletion)
+		acceptGroupEvent(t, instance, deletion)
+		storeAndHandle(t, instance, deletion)
+		storeAndHandle(t, instance, deletion)
+
+		if _, found := instance.Groups.GetMetadata(h); found {
+			t.Error("the group was not deleted")
+		}
+		// Clients catching up on kind 9008 learn of the deletion from this event.
+		if n := storedGroupEvents(t, instance, nostr.KindSimpleGroupDeleteGroup, h); n != 1 {
+			t.Errorf("stored deletion events = %d, want 1", n)
+		}
+	})
+}
+
+// Deleting a hidden group also deletes its kind 9008, so a second copy of the
+// deletion, accepted alongside the first, is stored again instead of being
+// reported as a duplicate. If the group was recreated in the meantime, that copy
+// must not delete the new group.
+func TestOnEventSaved_DuplicateDeletionSparesRecreatedGroup(t *testing.T) {
+	instance := createTestInstance()
+	creator := nostr.Generate()
+	h := "group-" + strings.ToLower(RandomString(8))
+	now := nostr.Now()
+	hidden := `{"private":true,"hidden":true}`
+
+	saveAndHandle(t, instance, creator, groupEvent(nostr.KindSimpleGroupCreateGroup, now, hidden, h))
+	deletion := signedEvent(t, creator, groupEvent(nostr.KindSimpleGroupDeleteGroup, now+1, "", h))
+	acceptGroupEvent(t, instance, deletion)
+	acceptGroupEvent(t, instance, deletion)
+
+	storeAndHandle(t, instance, deletion)
+	saveAndHandle(t, instance, creator, groupEvent(nostr.KindSimpleGroupCreateGroup, now+2, hidden, h))
+	storeAndHandle(t, instance, deletion)
+
+	if _, found := instance.Groups.GetMetadata(h); !found {
+		t.Error("a second copy of the first group's deletion deleted the recreated group")
+	}
+	if n := storedGroupEvents(t, instance, nostr.KindSimpleGroupDeleteGroup, h); n != 0 {
+		t.Errorf("stored deletion events = %d, want 0", n)
 	}
 }
 
@@ -161,19 +230,36 @@ func signedEvent(t *testing.T, secret nostr.SecretKey, evt nostr.Event) nostr.Ev
 	return evt
 }
 
-// storeAndHandle stores evt and runs OnEventSaved, as khatru does for an
-// accepted event.
+// acceptGroupEvent runs the group check OnEvent runs on evt, and fails the test
+// if the check rejects it.
+func acceptGroupEvent(t *testing.T, instance *Instance, evt nostr.Event) {
+	t.Helper()
+	check := instance.Groups.CheckWrite
+	if evt.Kind == nostr.KindSimpleGroupDeleteGroup {
+		check = instance.Groups.CheckDeletion
+	}
+	if reason := check(evt); reason != "" {
+		t.Fatalf("kind %d event rejected: %s", evt.Kind, reason)
+	}
+}
+
+// storeAndHandle hands evt, already accepted, to khatru's handling of an
+// accepted event: khatru stores it through Instance.StoreEvent and runs
+// OnEventSaved, unless the store reports the event as a duplicate.
 func storeAndHandle(t *testing.T, instance *Instance, evt nostr.Event) {
 	t.Helper()
-	if err := instance.Events.StoreEvent(evt); err != nil {
-		t.Fatalf("StoreEvent: %v", err)
+	instance.Relay.StoreEvent = instance.StoreEvent
+	instance.Relay.OnEventSaved = instance.OnEventSaved
+	if _, err := instance.Relay.AddEvent(context.Background(), evt); err != nil {
+		t.Fatalf("AddEvent: %v", err)
 	}
-	instance.OnEventSaved(context.Background(), evt)
 }
 
 func saveAndHandle(t *testing.T, instance *Instance, secret nostr.SecretKey, evt nostr.Event) {
 	t.Helper()
-	storeAndHandle(t, instance, signedEvent(t, secret, evt))
+	evt = signedEvent(t, secret, evt)
+	acceptGroupEvent(t, instance, evt)
+	storeAndHandle(t, instance, evt)
 }
 
 func storedGroupEvents(t *testing.T, instance *Instance, kind nostr.Kind, h string) int {

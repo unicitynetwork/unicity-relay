@@ -666,14 +666,19 @@ func (g *GroupStore) CheckDeletion(event nostr.Event) string {
 }
 
 // deletionApplies reports whether the kind 9008 with the given ID deletes group
-// h: the group must still exist and, if OnEvent accepted the event, be the
-// incarnation it was accepted for. Callers hold deletionMu.
+// h: OnEvent must have accepted the event, and the group must still exist and be
+// the incarnation it was accepted for. Applying a deletion consumes its record,
+// so another copy of the same event is dropped, even one stored again because
+// DeleteGroup removed the first copy. Callers hold deletionMu.
 func (g *GroupStore) deletionApplies(h string, id nostr.ID) bool {
 	accepted, pending := g.pendingDeletions.LoadAndDelete(id)
+	if !pending {
+		return false
+	}
 	if _, found := g.GetMetadata(h); !found {
 		return false
 	}
-	return !pending || accepted.(uint64) == g.incarnation(h)
+	return accepted.(uint64) == g.incarnation(h)
 }
 
 // startIncarnation marks group h as created again. Callers hold deletionMu.
