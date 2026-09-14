@@ -113,6 +113,20 @@ type GroupStore struct {
 	DebounceDelay   time.Duration
 	debounceMu      sync.Mutex
 	debouncePending map[string]*debounceEntry
+
+	// deletionMu serializes applying group creations and deletions.
+	// incarnations counts how many times each group ID has been created in
+	// this process, and pendingDeletions records, for each kind 9008 that
+	// OnEvent accepted, the incarnation of its group it was accepted for, so
+	// OnEventSaved does not apply it to a group recreated under the same ID.
+	deletionMu       sync.Mutex
+	incarnations     sync.Map // map[string]uint64   (key = group h)
+	pendingDeletions sync.Map // map[nostr.ID]uint64 (key = kind 9008 event ID)
+
+	// lifecycleBroadcasts holds the kind 9007 and 9008 events OnEventSaved is
+	// broadcasting after applying them. PreventBroadcast withholds every other
+	// broadcast of those kinds, which khatru repeats after OnEventSaved.
+	lifecycleBroadcasts sync.Map // map[nostr.ID]struct{}
 }
 
 // debounceEntry tracks one key's pending or in-flight rewrite. While
@@ -634,6 +648,61 @@ func (g *GroupStore) DeleteGroup(h string) {
 	g.membershipFullyLoaded.Delete(h)
 	g.roleCache.Delete(h)
 	g.creatorCache.Delete(h)
+}
+
+// CheckDeletion is CheckWrite for a kind 9008. When it accepts the deletion it
+// also records the incarnation of the group the deletion was checked against.
+// Both happen under deletionMu, so a recreation of the group cannot land in
+// between.
+func (g *GroupStore) CheckDeletion(event nostr.Event) string {
+	g.deletionMu.Lock()
+	defer g.deletionMu.Unlock()
+
+	if reason := g.CheckWrite(event); reason != "" {
+		return reason
+	}
+	g.pendingDeletions.Store(event.ID, g.incarnation(GetGroupIDFromEvent(event)))
+	return ""
+}
+
+// deletionApplies reports whether the kind 9008 with the given ID deletes group
+// h: the group must still exist and, if OnEvent accepted the event, be the
+// incarnation it was accepted for. Callers hold deletionMu.
+func (g *GroupStore) deletionApplies(h string, id nostr.ID) bool {
+	accepted, pending := g.pendingDeletions.LoadAndDelete(id)
+	if _, found := g.GetMetadata(h); !found {
+		return false
+	}
+	return !pending || accepted.(uint64) == g.incarnation(h)
+}
+
+// startIncarnation marks group h as created again. Callers hold deletionMu.
+func (g *GroupStore) startIncarnation(h string) {
+	g.incarnations.Store(h, g.incarnation(h)+1)
+}
+
+func (g *GroupStore) incarnation(h string) uint64 {
+	if v, ok := g.incarnations.Load(h); ok {
+		return v.(uint64)
+	}
+	return 0
+}
+
+// DeleteDeletionEvents removes the stored kind 9008 events for group h.
+func (g *GroupStore) DeleteDeletionEvents(h string) {
+	filter := nostr.Filter{
+		Kinds: []nostr.Kind{nostr.KindSimpleGroupDeleteGroup},
+		Tags:  nostr.TagMap{"h": []string{h}},
+	}
+
+	// Collect IDs first to avoid holding the DB connection during deletion
+	var toDelete []nostr.ID
+	for event := range g.Events.QueryEvents(filter, 0) {
+		toDelete = append(toDelete, event.ID)
+	}
+	for _, id := range toDelete {
+		g.Events.DeleteEvent(id)
+	}
 }
 
 // Admins

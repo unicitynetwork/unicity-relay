@@ -316,11 +316,12 @@ func (instance *Instance) PreventBroadcast(ws *khatru.WebSocket, filter nostr.Fi
 		return true
 	}
 
-	// OnEventSaved broadcasts a group deletion while the group still exists.
-	// khatru broadcasts the same event again after the group is gone, when
-	// CanRead would let every reader see it.
-	if event.Kind == nostr.KindSimpleGroupDeleteGroup {
-		if _, found := instance.Groups.GetMetadata(GetGroupIDFromEvent(event)); !found {
+	// OnEventSaved broadcasts group creations and deletions itself when it
+	// applies them. khatru broadcasts every accepted kind 9007 and 9008 again
+	// afterwards, including ones OnEventSaved dropped, so only the broadcast
+	// OnEventSaved makes goes out.
+	if event.Kind == nostr.KindSimpleGroupCreateGroup || event.Kind == nostr.KindSimpleGroupDeleteGroup {
+		if _, applying := instance.Groups.lifecycleBroadcasts.Load(event.ID); !applying {
 			return true
 		}
 	}
@@ -330,6 +331,14 @@ func (instance *Instance) PreventBroadcast(ws *khatru.WebSocket, filter nostr.Fi
 	}
 
 	return false
+}
+
+// broadcastLifecycleEvent broadcasts a group creation or deletion OnEventSaved
+// has applied, marked so that PreventBroadcast lets it through.
+func (instance *Instance) broadcastLifecycleEvent(event nostr.Event) {
+	instance.Groups.lifecycleBroadcasts.Store(event.ID, struct{}{})
+	instance.Relay.BroadcastEvent(event)
+	instance.Groups.lifecycleBroadcasts.Delete(event.ID)
 }
 
 func (instance *Instance) StoreEvent(ctx context.Context, event nostr.Event) error {
@@ -461,7 +470,11 @@ func (instance *Instance) OnEvent(ctx context.Context, event nostr.Event) (rejec
 	}
 
 	if instance.Groups.IsGroupEvent(event) {
-		if err := instance.Groups.CheckWrite(event); err != "" {
+		check := instance.Groups.CheckWrite
+		if event.Kind == nostr.KindSimpleGroupDeleteGroup {
+			check = instance.Groups.CheckDeletion
+		}
+		if err := check(event); err != "" {
 			return true, err
 		}
 	}
@@ -543,6 +556,24 @@ func (instance *Instance) OnEventSaved(ctx context.Context, event nostr.Event) {
 	}
 
 	if event.Kind == nostr.KindSimpleGroupCreateGroup {
+		// Creations and deletions of a group are applied one at a time. Two
+		// creations of the same group ID can both pass CheckWrite; the later
+		// one finds the group already created and is dropped, so it neither
+		// takes the group over nor starts a new incarnation.
+		instance.Groups.deletionMu.Lock()
+		defer instance.Groups.deletionMu.Unlock()
+		if _, found := instance.Groups.GetMetadata(h); found {
+			if err := instance.Events.DeleteEvent(event.ID); err != nil {
+				log.Printf("Failed to drop a second creation of group %q: %v", h, err)
+			}
+			return
+		}
+		// A deleted group's ID can be reused: start a new incarnation, so that
+		// a deletion accepted for the old group is not applied to this one, and
+		// drop the old group's kind 9008, which CanRead would otherwise return
+		// as a deletion of this group.
+		instance.Groups.startIncarnation(h)
+		instance.Groups.DeleteDeletionEvents(h)
 		instance.Groups.creatorCache.Store(h, event.PubKey)
 		// Brand-new group: there are no pre-existing members beyond
 		// the creator we're about to add. Mark membership as fully
@@ -564,6 +595,7 @@ func (instance *Instance) OnEventSaved(ctx context.Context, event nostr.Event) {
 		if err := instance.Groups.UpdateAdminsList(h); err != nil {
 			log.Printf("Failed to update admins list for group %q: %v", h, err)
 		}
+		instance.broadcastLifecycleEvent(event)
 	}
 
 	if event.Kind == nostr.KindSimpleGroupEditMetadata {
@@ -576,11 +608,25 @@ func (instance *Instance) OnEventSaved(ctx context.Context, event nostr.Event) {
 	}
 
 	if event.Kind == nostr.KindSimpleGroupDeleteGroup {
+		// Creations and deletions of a group are applied one at a time. A
+		// deletion is dropped instead of applied when its group is already
+		// gone, because another deletion of it was applied first, or when the
+		// group was recreated after OnEvent accepted the deletion. Applying it
+		// would delete the recreated group, and keeping its event would leave
+		// a kind 9008 that CanRead returns to anyone, which for a hidden group
+		// reveals that the group existed.
+		instance.Groups.deletionMu.Lock()
+		defer instance.Groups.deletionMu.Unlock()
+		if !instance.Groups.deletionApplies(h, event.ID) {
+			if err := instance.Events.DeleteEvent(event.ID); err != nil {
+				log.Printf("Failed to drop a deletion of group %q that no longer applies: %v", h, err)
+			}
+			return
+		}
 		// DeleteGroup removes the metadata and membership PreventBroadcast
 		// needs, and khatru broadcasts this event only after OnEventSaved
-		// returns. Broadcast it while the group still exists; PreventBroadcast
-		// withholds khatru's own broadcast once the group is gone.
-		instance.Relay.BroadcastEvent(event)
+		// returns, so broadcast it while the group still exists.
+		instance.broadcastLifecycleEvent(event)
 		instance.Groups.DeleteGroup(h)
 	}
 }

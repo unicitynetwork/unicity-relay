@@ -91,6 +91,8 @@ func TestInstance_PreventBroadcast(t *testing.T) {
 		{name: "write-only event", authed: []nostr.PubKey{member}, event: nostr.Event{Kind: RELAY_JOIN}, prevent: true},
 		{name: "group members list", authed: []nostr.PubKey{member}, event: nostr.Event{Kind: nostr.KindSimpleGroupMembers, Tags: nostr.Tags{{"d", "public"}}}, prevent: true},
 		{name: "deletion of a group that no longer exists", open: true, authed: []nostr.PubKey{member}, event: nostr.Event{Kind: nostr.KindSimpleGroupDeleteGroup, Tags: nostr.Tags{{"h", "deleted"}}}, prevent: true},
+		{name: "deletion of an existing group not broadcast by OnEventSaved", open: true, authed: []nostr.PubKey{member}, event: nostr.Event{Kind: nostr.KindSimpleGroupDeleteGroup, Tags: nostr.Tags{{"h", "public"}}}, prevent: true},
+		{name: "creation of an existing group not broadcast by OnEventSaved", open: true, authed: []nostr.PubKey{member}, event: nostr.Event{Kind: nostr.KindSimpleGroupCreateGroup, Tags: nostr.Tags{{"h", "public"}}}, prevent: true},
 	}
 
 	for _, tt := range tests {
