@@ -166,7 +166,10 @@ func seedPerfData(t *testing.T) *EventStore {
 // and returns the full plan text.
 func explainAnalyze(t *testing.T, store *EventStore, filter nostr.Filter) string {
 	t.Helper()
-	qb := store.buildSelectQuery(filter)
+	qb, err := store.buildSelectQuery(filter)
+	if err != nil {
+		t.Fatalf("buildSelectQuery: %v", err)
+	}
 	sql, args, err := qb.ToSql()
 	if err != nil {
 		t.Fatalf("ToSql: %v", err)

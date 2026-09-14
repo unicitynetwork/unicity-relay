@@ -1,6 +1,6 @@
 # Zooid (Unicity Fork)
 
-This is a fork of [Zooid](https://github.com/coracle-social/zooid), a multi-tenant relay based on [Khatru](https://gitworkshop.dev/fiatjaf.com/nostrlib/tree/master/khatru) which implements a range of access controls. This fork is customized for use with [Unicity Sphere](https://github.com/unicitylabs/sphere) for NIP-29 group chat functionality.
+This is a fork of [Zooid](https://gitea.coracle.social/coracle/zooid), a multi-tenant relay based on [Khatru](https://gitworkshop.dev/fiatjaf.com/nostrlib/tree/master/khatru) which implements a range of access controls. This fork is customized for use with [Unicity Sphere](https://github.com/unicitylabs/sphere) for NIP-29 group chat functionality.
 
 ## Unicity Fork Modifications
 
@@ -96,7 +96,7 @@ Contains information for populating the relay's `nip11` document.
 Contains policy and access related configuration.
 
 - `public_join` - whether to allow non-members to join the relay without an invite code. Defaults to `false`.
-- `strip_signatures` - whether to remove signatures when serving events to non-admins. This requires clients/users to trust the relay to properly authenticate signatures. Be cautious about using this; a malicious relay will be able to execute all kinds of attacks, including potentially serving events unrelated to a community use case.
+- `strip_signatures` - whether to remove signatures when serving events to non-admins. This requires clients/users to trust the relay to properly authenticate signatures. Be cautious about using this; a malicious relay will be able to execute all kinds of attacks, including potentially serving events unrelated to a community use case. Signatures are removed only from events returned for queries; events delivered live to open subscriptions keep their signatures.
 
 ### `[groups]`
 
@@ -206,7 +206,7 @@ podman run -it \
   -e DATABASE_URL="postgres://zooid:password@db-host:5432/zooid?sslmode=verify-full" \
   -v ./config:/app/config \
   -v ./media:/app/media \
-  ghcr.io/coracle-social/zooid
+  ghcr.io/unicitynetwork/unicity-relay
 ```
 
 ## Running with Unicity Sphere
