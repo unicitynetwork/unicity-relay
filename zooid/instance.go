@@ -316,15 +316,6 @@ func (instance *Instance) PreventBroadcast(ws *khatru.WebSocket, filter nostr.Fi
 		return true
 	}
 
-	// A put-user or remove-user event reaches the pubkey it names. Depending
-	// on the path (GroupStore.AddMember, OnEventSaved), membership is updated
-	// before or after the event is broadcast, so CanRead alone could withhold
-	// it from the user it is about.
-	if (event.Kind == nostr.KindSimpleGroupPutUser || event.Kind == nostr.KindSimpleGroupRemoveUser) &&
-		event.Tags.FindWithValue("p", pubkey.Hex()) != nil {
-		return false
-	}
-
 	if instance.Groups.IsGroupEvent(event) && !instance.Groups.CanRead(pubkey, event) {
 		return true
 	}
