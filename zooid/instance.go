@@ -259,7 +259,7 @@ func (instance *Instance) GenerateInviteEvent(pubkey nostr.PubKey) nostr.Event {
 	filter := nostr.Filter{
 		Kinds: []nostr.Kind{RELAY_INVITE},
 		Tags: nostr.TagMap{
-			"#p": []string{pubkey.Hex()},
+			"p": []string{pubkey.Hex()},
 		},
 	}
 
