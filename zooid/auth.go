@@ -1,6 +1,7 @@
 package zooid
 
 import (
+	"context"
 	"reflect"
 	"sync"
 	"unsafe"
@@ -34,4 +35,14 @@ func lastAuthedPubkey(ws *khatru.WebSocket) (nostr.PubKey, bool) {
 		return nostr.ZeroPK, false
 	}
 	return ws.AuthedPublicKeys[len(ws.AuthedPublicKeys)-1], true
+}
+
+// getAuthed is khatru.GetAuthed with a websocket connection's pubkey read
+// through lastAuthedPubkey. NIP-86 requests arrive over HTTP without a
+// connection, so khatru resolves those.
+func getAuthed(ctx context.Context) (nostr.PubKey, bool) {
+	if ws := khatru.GetConnection(ctx); ws != nil {
+		return lastAuthedPubkey(ws)
+	}
+	return khatru.GetAuthed(ctx)
 }

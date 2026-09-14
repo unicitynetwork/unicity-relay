@@ -5,7 +5,6 @@ import (
 	"sync"
 
 	"fiatjaf.com/nostr"
-	"fiatjaf.com/nostr/khatru"
 	"fiatjaf.com/nostr/nip86"
 )
 
@@ -414,7 +413,7 @@ func (m *ManagementStore) ValidateJoinRequest(event nostr.Event) (reject bool, e
 
 func (m *ManagementStore) Enable(instance *Instance) {
 	instance.Relay.ManagementAPI.OnAPICall = func(ctx context.Context, mp nip86.MethodParams) (reject bool, msg string) {
-		pubkey, ok := khatru.GetAuthed(ctx)
+		pubkey, ok := getAuthed(ctx)
 
 		if !ok {
 			return true, "blocked: please authenticate in order to manage this relay"

@@ -184,7 +184,7 @@ func (instance *Instance) Cleanup() {
 // Utility methods
 
 func (instance *Instance) StripSignature(ctx context.Context, event nostr.Event) nostr.Event {
-	pubkey, _ := khatru.GetAuthed(ctx)
+	pubkey, _ := getAuthed(ctx)
 
 	if instance.Config.Policy.StripSignatures && !instance.Config.CanManage(pubkey) {
 		var zeroSig [64]byte
@@ -308,17 +308,12 @@ func (instance *Instance) PreventBroadcast(ws *khatru.WebSocket, filter nostr.Fi
 		return true
 	}
 
-	if event.Kind == RELAY_INVITE || instance.IsInternalEvent(event) {
+	if instance.Management.PubkeyIsBanned(pubkey) {
 		return true
 	}
 
-	// A put-user or remove-user event reaches the pubkey it names. Depending
-	// on the path (GroupStore.AddMember, OnEventSaved), membership is updated
-	// before or after the event is broadcast, so CanRead alone could withhold
-	// it from the user it is about.
-	if (event.Kind == nostr.KindSimpleGroupPutUser || event.Kind == nostr.KindSimpleGroupRemoveUser) &&
-		event.Tags.FindWithValue("p", pubkey.Hex()) != nil {
-		return false
+	if event.Kind == RELAY_INVITE || instance.IsInternalEvent(event) {
+		return true
 	}
 
 	if instance.Groups.IsGroupEvent(event) && !instance.Groups.CanRead(pubkey, event) {
@@ -343,10 +338,14 @@ func (instance *Instance) DeleteEvent(ctx context.Context, id nostr.ID) error {
 // Requests
 
 func (instance *Instance) OnRequest(ctx context.Context, filter nostr.Filter) (reject bool, msg string) {
-	pubkey, ok := khatru.GetAuthed(ctx)
+	pubkey, ok := getAuthed(ctx)
 
 	if !ok {
 		return true, "auth-required: authentication is required for access"
+	}
+
+	if instance.Management.PubkeyIsBanned(pubkey) {
+		return true, "restricted: you have been banned from this relay"
 	}
 
 	// If open policy, allow all authenticated users; otherwise require membership
@@ -366,7 +365,7 @@ func (instance *Instance) QueryStored(ctx context.Context, filter nostr.Filter) 
 				}
 			}
 		} else {
-			pubkey, _ := khatru.GetAuthed(ctx)
+			pubkey, _ := getAuthed(ctx)
 			generated := make([]nostr.Event, 0)
 
 			if slices.Contains(filter.Kinds, RELAY_INVITE) && instance.Config.CanInvite(pubkey) {
@@ -413,11 +412,21 @@ func (instance *Instance) QueryStored(ctx context.Context, filter nostr.Filter) 
 // Event publishing
 
 func (instance *Instance) OnEvent(ctx context.Context, event nostr.Event) (reject bool, msg string) {
+	// Check bans before the recipient shortcut below, which accepts zap
+	// receipts and gift wraps without authenticating their author.
+	if instance.Management.EventIsBanned(event.ID) {
+		return true, "restricted: this event has been banned from this relay"
+	}
+
+	if instance.Management.PubkeyIsBanned(event.PubKey) {
+		return true, "restricted: event author has been banned from this relay"
+	}
+
 	if instance.AllowRecipientEvent(event) {
 		return false, ""
 	}
 
-	pubkey, isAuthenticated := khatru.GetAuthed(ctx)
+	pubkey, isAuthenticated := getAuthed(ctx)
 
 	if !isAuthenticated {
 		return true, "auth-required: authentication is required for access"
@@ -446,10 +455,6 @@ func (instance *Instance) OnEvent(ctx context.Context, event nostr.Event) (rejec
 		if err := instance.Groups.CheckWrite(event); err != "" {
 			return true, err
 		}
-	}
-
-	if instance.Management.EventIsBanned(event.ID) {
-		return true, "restricted: this event has been banned from this relay"
 	}
 
 	return false, ""
